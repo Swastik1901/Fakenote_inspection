@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FakeNote Inspector — explainable fake currency detection</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f6f3ec;--surf:#fffdf8;--ink:#1b1d22;--mut:#656a76;--gold:#8f6f22;--line:rgba(0,0,0,.1);--ok:#2f8f66;--bad:#c0453f;
+ --serif:'Fraunces',Georgia,'Times New Roman',serif;--sans:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+ box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0b0d12;--surf:#11141b;--ink:#e8e6e1;--mut:#8b909c;--gold:#c9a96a;--line:rgba(255,255,255,.09);--ok:#5fb88a;--bad:#d4605a}}
+:root[data-theme="dark"]{--bg:#0b0d12;--surf:#11141b;--ink:#e8e6e1;--mut:#8b909c;--gold:#c9a96a;--line:rgba(255,255,255,.09);--ok:#5fb88a;--bad:#d4605a}
+html{scroll-behavior:smooth;scroll-padding-top:calc(env(safe-area-inset-top,0px) + 64px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:30;background:var(--bg)}
+a{color:inherit}
+.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+nav{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:var(--bg);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+.brand{font-family:var(--serif);font-size:1.15rem;font-weight:600;text-decoration:none}
+.links{display:flex;gap:22px;font-size:.88rem;color:var(--mut)}.links a{text-decoration:none}.links a:hover{color:var(--ink)}
+.eyebrow{font-size:.72rem;letter-spacing:.26em;text-transform:uppercase;color:var(--gold);font-weight:600}
+h1,h2,h3{font-family:var(--serif);font-weight:500;line-height:1.12;margin:0}
+h1{font-size:clamp(2.2rem,5.6vw,3.8rem);margin:.5rem 0 1rem}
+h2{font-size:clamp(1.6rem,3.4vw,2.3rem);margin:.4rem 0 .8rem}
+p{margin:0 0 1rem;color:var(--mut)}
+.hero{display:grid;grid-template-columns:1.05fr 1fr;gap:44px;align-items:center;padding:64px 0 54px}
+.lead{font-size:1.08rem;max-width:520px}
+.cta{display:flex;gap:12px;flex-wrap:wrap;margin:1.4rem 0 1.6rem}
+.btn{display:inline-block;padding:12px 22px;border-radius:999px;font-weight:600;font-size:.92rem;text-decoration:none;border:1px solid var(--line)}
+.btn.pri{background:var(--gold);color:var(--bg);border-color:var(--gold)}
+.stats{display:flex;gap:28px;flex-wrap:wrap;font-size:.85rem;color:var(--mut)}.stats b{display:block;font-family:var(--serif);font-size:1.5rem;color:var(--ink);font-weight:500}
+.note-svg{width:100%;height:auto;border-radius:18px;border:1px solid var(--line);background:var(--surf);padding:14px}
+.scan{animation:scan 4.5s ease-in-out infinite}
+@keyframes scan{0%,100%{transform:translateX(0)}50%{transform:translateX(430px)}}
+@media (prefers-reduced-motion:reduce){.scan{animation:none}}
+section{padding:58px 0;border-top:1px solid var(--line)}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(3,1fr);margin-top:26px}
+.card{background:var(--surf);border:1px solid var(--line);border-radius:16px;padding:20px 22px}
+.card .n{font-family:var(--serif);color:var(--gold);font-size:1.3rem}
+.card h3{font-size:1.1rem;margin:.2rem 0 .4rem;font-family:var(--sans);font-weight:600}
+.card p{font-size:.9rem;margin:0}
+.tag{display:inline-block;margin-top:10px;font-size:.72rem;color:var(--bad);border:1px solid var(--line);border-radius:99px;padding:2px 10px}
+.split{display:grid;grid-template-columns:1fr 1.1fr;gap:40px;align-items:center}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.pair figure{margin:0;background:var(--surf);border:1px solid var(--line);border-radius:16px;padding:12px;text-align:center}
+.pair figcaption{font-size:.8rem;color:var(--mut);margin-top:6px}
+.scroll{overflow-x:auto;margin-top:22px;border:1px solid var(--line);border-radius:16px;background:var(--surf)}
+table{border-collapse:collapse;width:100%;min-width:560px;font-size:.9rem}
+th,td{text-align:left;padding:13px 18px;border-bottom:1px solid var(--line)}th{color:var(--gold);font-size:.74rem;letter-spacing:.14em;text-transform:uppercase}
+tr:last-child td{border-bottom:none}td:first-child{color:var(--ink);font-weight:500}td{color:var(--mut)}
+pre{background:var(--surf);border:1px solid var(--line);border-radius:14px;padding:18px 20px;overflow-x:auto;font-size:.86rem;line-height:1.7;color:var(--ink);margin:0 0 1rem}
+.limit{background:var(--surf);border:1px solid var(--line);border-left:3px solid var(--gold);border-radius:12px;padding:16px 20px;font-size:.92rem;color:var(--mut)}
+footer{padding:30px 0 44px;border-top:1px solid var(--line);font-size:.82rem;color:var(--mut)}
+@media (max-width:820px){.hero,.split{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.links{display:none}.hero{padding-top:36px}}
+</style>
+</head>
+<body>
+<nav><div class="wrap"><a class="brand" href="#top">💵 FakeNote</a>
+<div class="links"><a href="#how">How it works</a><a href="#checks">Checks</a><a href="#watermark">Watermark</a><a href="#compare">Why classical</a><a href="#start">Get started</a></div></div></nav>
+
+<main id="top">
+<div class="wrap hero">
+ <div>
+  <div class="eyebrow">Currency forensics · classical image processing</div>
+  <h1>Spot a fake note, and see exactly why.</h1>
+  <p class="lead">FakeNote Inspector checks every security feature of a banknote on its own and shows the evidence for each. No black box, no GPU, no training data: just explainable computer vision.</p>
+  <div class="cta"><a class="btn pri" href="#checks">See the nine checks</a><a class="btn" href="#start">Run it yourself</a></div>
+  <div class="stats"><span><b>9</b>independent checks</span><span><b>0</b>black boxes</span><span><b>CPU</b>runs in milliseconds</span></div>
+ </div>
+ <svg class="note-svg" viewBox="0 0 520 250" role="img" aria-label="Illustration of a banknote with the inspected regions outlined">
+  <defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b9b48c"/><stop offset="1" stop-color="#d9d3a8"/></linearGradient>
+  <radialGradient id="wm" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#fff" stop-opacity=".75"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient></defs>
+  <rect x="10" y="10" width="500" height="230" rx="10" fill="url(#g)" stroke="#8a8660"/>
+  <g fill="none" stroke="#6f6c4a" stroke-width=".8" opacity=".55"><path d="M20 40c60-20 120 20 180 0s120 20 180 0"/><path d="M20 60c60-20 120 20 180 0s120 20 180 0"/><path d="M20 200c60-20 120 20 180 0s120 20 180 0"/></g>
+  <ellipse cx="150" cy="128" rx="52" ry="68" fill="#7d7a5a" opacity=".85"/><circle cx="150" cy="104" r="30" fill="#5f5c42" opacity=".8"/>
+  <rect x="286" y="10" width="14" height="230" fill="#3d3b2a"/><g fill="#d9d3a8"><rect x="289" y="40" width="8" height="12"/><rect x="289" y="84" width="8" height="12"/><rect x="289" y="128" width="8" height="12"/><rect x="289" y="172" width="8" height="12"/></g>
+  <rect x="338" y="40" width="80" height="120" fill="url(#wm)" opacity=".6"/>
+  <text x="420" y="205" font-family="Georgia,serif" font-size="28" fill="#4f7d5c" font-weight="700">₹500</text>
+  <text x="330" y="222" font-family="monospace" font-size="13" fill="#2b2a1d">5QB 814491</text><text x="30" y="82" font-family="monospace" font-size="13" fill="#2b2a1d">5QB 814491</text>
+  <g fill="none" stroke="var(--ok)" stroke-width="2" stroke-dasharray="5 4"><rect x="262" y="8" width="62" height="234" rx="4"/><rect x="98" y="48" width="104" height="164" rx="4"/><rect x="326" y="206" width="124" height="22" rx="3"/><rect x="26" y="68" width="124" height="20" rx="3"/><rect x="330" y="34" width="96" height="128" rx="4"/></g>
+  <rect class="scan" x="20" y="14" width="3" height="222" fill="var(--gold)" opacity=".9"/>
+ </svg>
+</div>
+
+<section id="how"><div class="wrap">
+ <div class="eyebrow">How it works</div><h2>From a phone photo to an evidence-backed verdict</h2>
+ <div class="grid">
+  <div class="card"><div class="n">01</div><h3>Capture and straighten</h3><p>Canny edges, contour and a four-corner fit locate the note. A perspective warp turns any angle into a clean, fixed-size view.</p></div>
+  <div class="card"><div class="n">02</div><h3>Inspect every feature</h3><p>Nine focused checks each produce a score and a picture: the thread, the print, the texture, the serial numbers and the watermark.</p></div>
+  <div class="card"><div class="n">03</div><h3>Weakest-link verdict</h3><p>Scores are blended with extra weight on the two weakest checks, so one clearly failed feature cannot be hidden by strong ones.</p></div>
+ </div>
+</div></section>
+
+<section id="checks"><div class="wrap">
+ <div class="eyebrow">The checks</div><h2>Nine features, nine pieces of evidence</h2>
+ <div class="grid">
+  <div class="card"><div class="n">1</div><h3>Security thread</h3><p>Finds the unbroken vertical thread and measures how continuous it is.</p><span class="tag">missing or broken thread</span></div>
+  <div class="card"><div class="n">2</div><h3>Print sharpness</h3><p>Fine-line detail measured at a fixed scale, so photo resolution does not skew it.</p><span class="tag">soft photocopies</span></div>
+  <div class="card"><div class="n">3</div><h3>Halftone and moiré</h3><p>An FFT spectrum exposes the regular dot grid left by inkjet and laser printers.</p><span class="tag">home reprints</span></div>
+  <div class="card"><div class="n">4</div><h3>Ink saturation</h3><p>Genuine inks are vivid and specific. Faded or black-and-white copies are not.</p><span class="tag">desaturated copies</span></div>
+  <div class="card"><div class="n">5</div><h3>Intaglio texture</h3><p>Local Binary Patterns compare the portrait’s raised-ink micro-texture with a genuine note.</p><span class="tag">flat reproductions</span></div>
+  <div class="card"><div class="n">6</div><h3>Reference match</h3><p>ORB features and RANSAC confirm the design geometry matches a genuine reference.</p><span class="tag">wrong design</span></div>
+  <div class="card"><div class="n">7</div><h3>Serial numbers</h3><p>The number is printed twice. OCR reads both panels, tolerant of look-alike letters, and they must agree.</p><span class="tag">invalid or mismatched</span></div>
+  <div class="card"><div class="n">8</div><h3>Watermark window</h3><p>In normal light the window must be blank. A visible portrait there was printed on the surface.</p><span class="tag">printed watermark</span></div>
+  <div class="card"><div class="n">9</div><h3>Watermark, backlit</h3><p>Against light, a soft portrait must sit inside the paper itself.</p><span class="tag">no real watermark</span></div>
+ </div>
+</div></section>
+
+<section id="watermark"><div class="wrap split">
+ <div>
+  <div class="eyebrow">Hold it to the light</div><h2>The watermark check, done the way people do it</h2>
+  <p>Most people tilt a note toward a lamp to find the Gandhi watermark. The Inspector does the same with a second, optional photo taken with light passing through the note.</p>
+  <p>Two checks work together. The backlit photo shows that a smooth portrait lives <em>inside</em> the paper. The normal-light photo shows the window is blank, so nothing was just <em>printed</em> on top.</p>
+ </div>
+ <div class="pair">
+  <figure><svg viewBox="0 0 140 150" width="100%" role="img" aria-label="Normal light: blank window"><rect x="6" y="6" width="128" height="138" rx="8" fill="#d9d3a8" stroke="#8a8660"/><rect x="30" y="26" width="80" height="98" rx="4" fill="none" stroke="#8a8660" stroke-dasharray="4 4"/></svg><figcaption>Normal light: window stays blank</figcaption></figure>
+  <figure><svg viewBox="0 0 140 150" width="100%" role="img" aria-label="Backlit: soft portrait visible"><defs><radialGradient id="p" cx=".5" cy=".4" r=".55"><stop offset="0" stop-color="#fff" stop-opacity=".95"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient></defs><rect x="6" y="6" width="128" height="138" rx="8" fill="#e9e0b0" stroke="#8a8660"/><ellipse cx="70" cy="62" rx="26" ry="34" fill="url(#p)"/><ellipse cx="70" cy="112" rx="34" ry="22" fill="url(#p)" opacity=".7"/></svg><figcaption>Held to light: soft portrait appears</figcaption></figure>
+ </div>
+</div></section>
+
+<section id="compare"><div class="wrap">
+ <div class="eyebrow">Why classical</div><h2>Explainable by design</h2>
+ <div class="scroll"><table>
+  <tr><th></th><th>FakeNote Inspector</th><th>Typical CNN classifier</th></tr>
+  <tr><td>Training data</td><td>None, only a few references</td><td>Hundreds of genuine and fake images</td></tr>
+  <tr><td>Explainability</td><td>Score and picture per feature</td><td>Black box, approximated by Grad-CAM</td></tr>
+  <tr><td>Compute</td><td>CPU, milliseconds</td><td>GPU to train</td></tr>
+  <tr><td>Failure mode</td><td>Rules need tuning per note</td><td>Overfits to dataset quirks</td></tr>
+ </table></div>
+</div></section>
+
+<section id="start"><div class="wrap">
+ <div class="eyebrow">Get started</div><h2>Run it in two minutes</h2>
+<pre>pip install -r requirements.txt
+brew install tesseract      # optional, enables the serial-number check
+streamlit run app.py</pre>
+ <p>Put one or two clean genuine note photos in <code>references/</code>, upload a photo, and use the attack simulator to watch the verdict react to a photocopy or inkjet reprint. Calibrate thresholds on your own data with <code>evaluate.py</code>.</p>
+ <div class="limit"><b style="color:var(--ink)">An honest note.</b> This is a screening aid, not a certification tool. Phone cameras cannot capture UV, microprinting or tactile features, the defaults target the ₹500 Mahatma Gandhi series, and the watermark thresholds need calibration on real backlit photos. Suspicious notes should be verified by a bank.</div>
+</div></section>
+</main>
+<footer><div class="wrap">FakeNote Inspector · Image Processing course project · Classical computer vision with OpenCV</div></footer>
+</body>
+</html>

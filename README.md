@@ -13,9 +13,11 @@ the measurement and a picture of the evidence.
 
 ```bash
 pip install -r requirements.txt
-brew install tesseract          # macOS. Strongly recommended (see section 4)
 streamlit run app.py
 ```
+
+Install Tesseract too (strongly recommended, see section 4 for macOS, Linux and Windows).
+On Windows, if `pip` is not found, use `py -m pip install -r requirements.txt` and `py -m streamlit run app.py`.
 
 The app opens at `http://localhost:8501`. Upload a photo, or use the webcam.
 
@@ -87,13 +89,46 @@ never treated as evidence of a fake.
 
 ## 4. Tesseract (OCR)
 
-`pytesseract` is only the Python wrapper. The **Tesseract program** must be installed on the computer:
+Tesseract is **recommended, not strictly required**. The app runs without it, but with reduced detection (see below).
+
+`pytesseract` (installed by `pip`) is only the Python wrapper. The **Tesseract program itself** must be installed on the
+computer, and it must be reachable from the terminal.
+
+**macOS**
 
 ```bash
-brew install tesseract          # macOS
-sudo apt install tesseract-ocr  # Debian / Ubuntu
-tesseract --version             # confirm it works
+brew install tesseract
 ```
+
+**Ubuntu / Debian**
+
+```bash
+sudo apt install tesseract-ocr
+```
+
+**Windows**
+
+1. Install the Windows build (maintained by UB Mannheim). Either use the terminal:
+
+   ```powershell
+   winget install UB-Mannheim.TesseractOCR
+   ```
+
+   or download the installer from <https://github.com/UB-Mannheim/tesseract/wiki> and run it (keep the default
+   English language data).
+2. Add the install folder to your PATH. The default folder is `C:\Program Files\Tesseract-OCR`.
+   Start menu, search "Edit the system environment variables", *Environment Variables*, select `Path`, *Edit*, *New*,
+   paste the folder, OK. (Some installer versions offer to do this for you.)
+3. **Close and reopen** the terminal (PowerShell or Command Prompt), then stop and restart `streamlit run app.py`.
+
+**Check that it works (all systems):**
+
+```bash
+tesseract --version
+```
+
+If this prints a version, the app will find it. If Windows says `'tesseract' is not recognized`, the folder from step 2
+is not on your PATH yet.
 
 Without Tesseract the app still runs, but:
 
@@ -199,7 +234,7 @@ python watermark_probe.py dataset/backlit_genuine dataset/backlit_plain_paper   
 | "This file could not be read as an image" | The file is corrupt or a different format renamed to .png/.jpg (AVIF, HEIC). Re-export it as PNG or JPG. `pip install pillow-heif` helps with HEIC/AVIF |
 | "This does not look like a banknote" | The photo shows several unrelated colours, is blank, or has the wrong shape. Retake it, or turn off *Reject non-banknote images* |
 | "No banknote detected" | The edges were not found. Use a plain background, or tick *Image is already a cropped note* |
-| Serial number or Issuer text always *skipped* | Tesseract is not installed or not on the PATH (`tesseract --version`) |
+| Serial number or Issuer text always *skipped* | Tesseract is not installed or not on the PATH. Run `tesseract --version`. On Windows, add `C:\Program Files\Tesseract-OCR` to PATH and reopen the terminal and the app |
 | Denomination shown as "estimated from colour" | Tesseract could not read the amount. Install it, or add a reference to `references/<value>/` |
 
 ---

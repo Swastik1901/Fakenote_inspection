@@ -58,7 +58,8 @@ def rectify(img):
     quad, edges = find_note_quad(img)
     if quad is None:
         note = cv2.resize(img, (NOTE_W, NOTE_H), interpolation=cv2.INTER_AREA)
-        return dict(note=note, quad=None, edges=edges, found=False)
+        return dict(note=note, note_hr=cv2.resize(img, (2 * NOTE_W, 2 * NOTE_H), interpolation=cv2.INTER_CUBIC),
+                    quad=None, edges=edges, found=False)
 
     rect = _order_points(quad)
     tl, tr, br, bl = rect
@@ -66,12 +67,14 @@ def rectify(img):
     h = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
     portrait = h > w
     out_w, out_h = (NOTE_H, NOTE_W) if portrait else (NOTE_W, NOTE_H)
-    dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    note = cv2.warpPerspective(img, M, (out_w, out_h))
-    if portrait:
-        note = cv2.rotate(note, cv2.ROTATE_90_CLOCKWISE)
-    return dict(note=note, quad=rect, edges=edges, found=True)
+    def warp(scale):
+        ow, oh = (NOTE_H, NOTE_W) if portrait else (NOTE_W, NOTE_H)
+        ow, oh = ow * scale, oh * scale
+        dst = np.array([[0, 0], [ow - 1, 0], [ow - 1, oh - 1], [0, oh - 1]], dtype="float32")
+        out = cv2.warpPerspective(img, cv2.getPerspectiveTransform(rect, dst), (ow, oh), flags=cv2.INTER_CUBIC)
+        return cv2.rotate(out, cv2.ROTATE_90_CLOCKWISE) if portrait else out
+    note, note_hr = warp(1), warp(2)       # note_hr keeps native detail for OCR of the serial numbers
+    return dict(note=note, note_hr=note_hr, quad=rect, edges=edges, found=True)
 
 
 def draw_quad(img, quad):

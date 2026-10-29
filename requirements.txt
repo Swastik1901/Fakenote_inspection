@@ -1,4 +1,6 @@
 opencv-python>=4.8
 numpy>=1.24
 streamlit>=1.30
-pytesseract>=0.3.10   # optional - needs the Tesseract binary installed on your system
+pillow>=10.0         # normally installed with streamlit; reads WebP/AVIF/GIF/ICO files that OpenCV cannot
+pytesseract>=0.3.10   # optional - needs the Tesseract binary installed on your system (brew install tesseract)
+pillow-heif>=0.16     # optional - lets the app open iPhone HEIC photos and AVIF files saved with a .png name

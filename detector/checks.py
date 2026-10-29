@@ -4,8 +4,11 @@ Every check returns a CheckResult with a 0..1 score (1 = looks genuine),
 a human-readable explanation, and optionally a debug image for the dashboard.
 A score of None means the check was skipped (e.g. no reference images).
 """
+import hashlib
 import re
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -23,6 +26,7 @@ class CheckResult:
     metric: str = ""
     roi: Optional[str] = None
     debug: Optional[np.ndarray] = field(default=None, repr=False)
+    decisive: bool = False        # a failing decisive check is positive proof of a non-genuine note and overrides the fused score
 
     @property
     def passed(self):
@@ -40,31 +44,73 @@ def _crop(img, roi):
 
 
 # ---------------------------------------------------------------- 1. Thread
+def _dash_count(mask, h, w):
+    """Find thread dashes in a 2-D mask (rows x band columns), tolerant to a tilted note: take narrow vertical blobs,
+    fit one line x = a*y + b through their centres and count the blobs lying on it. Returns (count, coverage)."""
+    k = max(int(0.012 * h), 2)
+    m = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_OPEN,
+                         np.ones((max(int(0.02 * h), 5), max(int(0.012 * w), 5)), np.uint8))   # text strokes are too thin to survive
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((2 * k + 1, 3), np.uint8))
+    n, _, st, cen = cv2.connectedComponentsWithStats((m > 0).astype(np.uint8))
+    blobs = [(cen[i][0], cen[i][1], st[i][3], st[i][2]) for i in range(1, n)
+             if st[i][3] >= 0.03 * h and st[i][2] <= 0.06 * w and st[i][3] >= 0.8 * st[i][2]]
+    best = []
+    for i in range(len(blobs)):
+        for j in range(i + 1, len(blobs)):
+            (x1, y1, _, _), (x2, y2, _, _) = blobs[i], blobs[j]
+            if abs(y2 - y1) < 0.05 * h:
+                continue
+            a = (x2 - x1) / (y2 - y1)
+            if abs(a) > 0.35:                                   # a thread is near-vertical
+                continue
+            on = [bl for bl in blobs if abs(bl[0] - (x1 + a * (bl[1] - y1))) <= 0.012 * w + 4]
+            if len(on) >= 2:                       # dashes of one thread have similar widths; random texture does not
+                mw = float(np.median([bl[3] for bl in on]))
+                on = [bl for bl in on if 0.6 * mw <= bl[3] <= 1.6 * mw]
+            if len(on) > len(best):
+                best = on
+    cover = sum(bl[2] for bl in best) / h
+    return len(best), float(cover), best
+
+
 def check_security_thread(note):
+    """Genuine Rs 500 notes carry a windowed thread: continuous in transmitted light, but in reflected light it shows
+    as a column of dark dashes. Score the better of (a) one continuous line, (b) several aligned dashes."""
     gray = cv2.cvtColor(note, cv2.COLOR_BGR2GRAY).astype(np.float32)
     h, w = gray.shape
     x0, _, x1, _ = C.ROIS["thread"]
     x0, x1 = int(x0 * w), int(x1 * w)
-    pad = 14
+    offs = C.THREAD_SIDE_OFFSETS
+    pad = max(offs)
     x0, x1 = max(x0, pad), min(x1, w - pad)
     band = gray[:, x0:x1]
-    side = np.stack([gray[:, x0 - 12:x1 - 12], gray[:, x0 - 8:x1 - 8],
-                     gray[:, x0 + 8:x1 + 8], gray[:, x0 + 12:x1 + 12]])
+    side = np.stack([gray[:, x0 + sgn * o:x1 + sgn * o] for o in offs for sgn in (-1, 1)])
     diff = band - np.median(side, axis=0)          # median ignores stray line-art on one side
-    dark = (diff < -14).mean(axis=0)
-    bright = (diff > 14).mean(axis=0)
-    cont = np.maximum(dark, bright)
+    dark_m, bright_m = diff < -14, diff > 14
+    cont = np.maximum(dark_m.mean(axis=0), bright_m.mean(axis=0))
     cont = np.convolve(cont, np.ones(3) / 3, mode="same")
     best = int(np.argmax(cont))
     best_val = float(cont[best])
 
+    # dashed thread: repeated narrow dark (or bright) blobs that line up, even if the note is tilted
+    g8 = np.clip(gray, 0, 255).astype(np.uint8)
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(0.06 * w) | 1, 41), 1))
+    bh = cv2.morphologyEx(g8, cv2.MORPH_BLACKHAT, kern)[:, x0:x1]       # dark features narrower than the kernel
+    th = cv2.morphologyEx(g8, cv2.MORPH_TOPHAT, kern)[:, x0:x1]         # bright features narrower than the kernel
+    dashes, cover, blobs = max((_dash_count(m, h, w) for m in (bh > 22, th > 22)), key=lambda t: t[0])
+    s_cont = _scale(best_val, *C.THREAD_CONT_RANGE)
+    s_dash = _scale(dashes, 2, 5) * _scale(cover, 0.05, 0.15)
+    score = max(s_cont, s_dash)
+
     dbg = note.copy()
-    cv2.line(dbg, (x0 + best, 0), (x0 + best, h), (0, 255, 255), 2)
+    cv2.line(dbg, (x0 + best, 0), (x0 + best, h), (0, 255, 255), 1)
+    for cx, cy, bh, bw in blobs:                      # show exactly which dashes were counted
+        cv2.rectangle(dbg, (int(x0 + cx - bw / 2) - 3, int(cy - bh / 2)), (int(x0 + cx + bw / 2) + 3, int(cy + bh / 2)), (255, 200, 0), 3)
     return CheckResult(
-        "Security thread", _scale(best_val, *C.THREAD_CONT_RANGE),
-        f"Strongest vertical line is continuous over {best_val*100:.0f}% of the note height "
-        f"(genuine notes carry an unbroken embedded thread).",
-        f"continuity = {best_val:.2f}", "thread", dbg)
+        "Security thread", score,
+        f"Strongest vertical line is continuous over {best_val*100:.0f}% of the note height, or shows {dashes} aligned "
+        f"dashes (a windowed thread looks dashed in reflected light). The better of the two is scored.",
+        f"continuity = {best_val:.2f}, dashes = {dashes}", "thread", dbg)
 
 
 # ------------------------------------------------------------ 2. Sharpness
@@ -120,9 +166,15 @@ def check_halftone(note):
 
 
 # -------------------------------------------------------------- 4. Saturation
-def check_saturation(note):
+def check_saturation(note, generic=False):
     hsv = cv2.cvtColor(note, cv2.COLOR_BGR2HSV)
-    mean_s = float(hsv[..., 1].mean())
+    H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    mean_s = float(S.mean())
+    lo, hi = C.INK_HUE
+    ink_pct = float(((S >= 25) & (V > 40) & (V < 235) & (H >= lo) & (H <= hi)).mean() * 100)
+    # Mean saturation alone depends on lighting/white balance (a real note photographed indoors can look grey).
+    # The note's own green/olive ink is a better signature: a black-and-white copy has none, even with a paper tint.
+    score = _scale(mean_s, *C.SATURATION_RANGE) if generic else max(_scale(ink_pct, *C.INK_RANGE), _scale(mean_s, *C.SATURATION_RANGE))
     hue = cv2.calcHist([hsv], [0], None, [180], [0, 180]).ravel()
     hue /= hue.sum() + 1e-9
     vis = np.zeros((120, 360, 3), np.uint8)
@@ -131,10 +183,10 @@ def check_saturation(note):
         hgt = int(min(hue[i] * 120 * 12, 118))
         cv2.rectangle(vis, (i * 2, 119 - hgt), (i * 2 + 1, 119), col, -1)
     return CheckResult(
-        "Ink saturation", _scale(mean_s, *C.SATURATION_RANGE),
-        "Genuine notes use vivid, specific ink colours. Black & white photocopies and "
-        "washed-out prints have very low saturation.",
-        f"mean S = {mean_s:.0f}/255", None, vis)
+        "Ink saturation", score,
+        "Genuine notes carry vivid green/olive ink. Black & white photocopies and washed-out prints have none, "
+        "even when the paper looks tinted. Judged on the ink itself, so a grey-looking phone photo is not penalised.",
+        f"green ink = {ink_pct:.1f}% of pixels, mean S = {mean_s:.0f}/255", None, vis)
 
 
 # ------------------------------------------------------------ 5. LBP texture
@@ -185,16 +237,28 @@ def _describe(img):
     return _orb.detectAndCompute(gray, None)
 
 
+_REF_CACHE = {}
+
+
 def load_references(paths):
+    """Decode + describe reference images. Cached by (path, mtime, size): Streamlit reruns the script on every widget change."""
     refs = []
     for p in paths:
-        img = cv2.imread(str(p))
-        if img is None:
+        try:
+            stt = Path(p).stat()
+            key = (str(p), stt.st_mtime_ns, stt.st_size)
+        except OSError:
             continue
-        img = cv2.resize(img, (C.NOTE_W, C.NOTE_H))
-        kp, des = _describe(img)
-        if des is not None:
-            refs.append((str(p), img, kp, des))
+        if key not in _REF_CACHE:
+            img = cv2.imread(str(p))
+            if img is None:
+                _REF_CACHE[key] = None
+            else:
+                img = cv2.resize(img, (C.NOTE_W, C.NOTE_H))
+                kp, des = _describe(img)
+                _REF_CACHE[key] = (str(p), img, kp, des) if des is not None else None
+        if _REF_CACHE[key] is not None:
+            refs.append(_REF_CACHE[key])
     return refs
 
 
@@ -204,7 +268,7 @@ def check_reference_match(note, refs):
                            "Skipped - add genuine note images to the references/ folder to enable this check.")
     kp, des = _describe(note)
     if des is None or len(kp) < 20:
-        return CheckResult("Reference match", 0.0, "Too few keypoints found in the note.", "keypoints < 20")
+        return CheckResult("Reference match", None, "Inconclusive - too few keypoints found in the note (not counted).")
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
     best = (-1.0, None, None, 0, 0)
     for name, rimg, rkp, rdes in refs:
@@ -226,12 +290,38 @@ def check_reference_match(note, refs):
     vis = cv2.drawMatches(note, kp, rimg, rkp, good, None, matchesMask=matches_mask,
                           matchColor=(0, 255, 120), singlePointColor=None,
                           flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-    score = _scale(ratio, *C.ORB_INLIER_RANGE) if inl >= 10 else 0.0
+    if inl < 10:
+        # A weak/blurry/small reference or a different framing fails to align even for a genuine note, and a
+        # missing match is no proof of forgery - so this check gives positive evidence only, never a penalty.
+        return CheckResult("Reference match", None,
+                           f"Inconclusive - could not align the note with the reference ({inl} inliers). Add a sharp, "
+                           "full-note reference image for a stronger check. Not counted.", f"{inl} inliers", None, vis)
+    score = _scale(ratio, *C.ORB_INLIER_RANGE)
     return CheckResult(
         "Reference match", score,
         f"ORB features matched against a genuine reference and verified with RANSAC homography "
         f"({inl} geometric inliers out of {ngood} good matches).",
         f"inlier ratio = {ratio:.2f}", None, vis)
+
+
+def best_inliers(note, refs):
+    """Largest RANSAC-verified ORB match count between the note and any reference (0 if none / too few features)."""
+    if not refs:
+        return 0
+    kp, des = _describe(note)
+    if des is None or len(kp) < 20:
+        return 0
+    bf, best = cv2.BFMatcher(cv2.NORM_HAMMING), 0
+    for _, _, rkp, rdes in refs:
+        pairs = bf.knnMatch(des, rdes, k=2)
+        good = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < 0.75 * n.distance]
+        if len(good) < 10:
+            continue
+        src = np.float32([kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([rkp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        _, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        best = max(best, int(mask.sum()) if mask is not None else 0)
+    return best
 
 
 # ------------------------------------------------------------ 7. Serial (OCR)
@@ -262,25 +352,35 @@ def _read_panel(note, key):
     """OCR one number panel with several darkness thresholds; return every valid serial found."""
     import pytesseract
     roi = _crop(note, C.ROIS[key])
-    gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), None, fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
-    cfg = "--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    fx = float(np.clip(220.0 / max(roi.shape[0], 1), 1.0, 3.5))      # aim for ~220 px tall text crops
+    gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
+    white = "-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     raw, valid = [], []
+    t_start = time.time()
     for pct, invert in ((8, False), (14, False), (20, False), (8, True), (14, True)):
+        if time.time() - t_start > 3.0:      # time budget per panel so a hopeless crop cannot stall the app
+            break
         t = np.percentile(gray, 100 - pct if invert else pct)
         mask = (gray >= t) if invert else (gray <= t)
         th = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel)   # strips thin line-art
         im = cv2.copyMakeBorder(255 - th, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-        try:
-            txt = pytesseract.image_to_string(im, config=cfg, timeout=8).strip().replace("\n", " ")
-        except Exception:          # Tesseract can crash/time out on degenerate crops - never take the app down
-            continue
-        if txt:
-            raw.append(txt)
-        fixed = correct_serial(txt)
-        if fixed:
-            valid.append(fixed)
+        for psm in (7, 6):          # 7 = one line; 6 = block (Tesseract finds the line itself when the crop is generous)
+            try:
+                txt = pytesseract.image_to_string(im, config=f"--psm {psm} {white}", timeout=3).strip().replace("\n", " ")
+            except Exception:       # Tesseract can crash/time out on degenerate crops - never take the app down
+                continue
+            if txt:
+                raw.append(txt)
+            fixed = correct_serial(txt)
+            if fixed:
+                valid.append(fixed)
+        if len(valid) >= 2:         # enough agreeing reads - stop early to keep the app fast
+            break
     return roi, raw, valid
+
+
+_SERIAL_CACHE = {}
 
 
 def check_serial(note):
@@ -292,24 +392,30 @@ def check_serial(note):
     except Exception:
         return CheckResult("Serial number", None,
                            "Skipped - install Tesseract + pytesseract to enable OCR of the serial number.")
+    cache_key = hashlib.md5(note.tobytes()).hexdigest()
+    if cache_key in _SERIAL_CACHE:                       # OCR is slow; sliders/toggles rerun the page, so remember it
+        return _SERIAL_CACHE[cache_key]
     roi_a, raw_a, val_a = _read_panel(note, "serial")
     roi_b, raw_b, val_b = _read_panel(note, "serial2") if "serial2" in C.ROIS else (None, [], [])
 
     pair = next(((a, b) for a in val_a for b in val_b if _canon(a) == _canon(b)), None)
     if pair:
         score, msg = 1.0, f"both number panels read as {pair[0]} / {pair[1]} and agree"
-    elif val_a and val_b:
-        score, msg = 0.3, f"panels disagree: {val_a[0]} vs {val_b[0]} (genuine notes print the same number twice)"
-    elif val_a or val_b:
-        score, msg = 0.5, f"only one panel gave a valid serial ({(val_a or val_b)[0]}); could not cross-check"
-    elif any(sum(ch.isdigit() for ch in t) >= 6 for t in raw_a + raw_b):
-        score, msg = 0.25, "digits found but no valid serial format could be read"
     else:
-        score, msg = 0.0, "no serial number could be read"
+        # OCR on a phone photo is unreliable, so a mismatch is not evidence of forgery. Two independent reads
+        # that agree are strong evidence (chance agreement is negligible); anything else is inconclusive.
+        dbg = roi_a if roi_b is None else np.vstack([cv2.resize(roi_a, (400, 90)), cv2.resize(roi_b, (400, 90))])
+        res = CheckResult("Serial number", None,
+                          "Inconclusive - the two serial panels could not be read to the same number (blur, glare or "
+                          "font). Not counted: an unreadable photo is not evidence of a fake.", "no agreement", "serial", dbg)
+        _SERIAL_CACHE[cache_key] = res
+        return res
 
     dbg = roi_a if roi_b is None else np.vstack([cv2.resize(roi_a, (400, 90)), cv2.resize(roi_b, (400, 90))])
-    return CheckResult("Serial number", score, f"Format: digit-letter-letter-6 digits. Result: {msg}.",
-                       "bottom-right vs top-left panel", "serial", dbg)
+    res = CheckResult("Serial number", score, f"Format: digit-letter-letter-6 digits. Result: {msg}.",
+                      "bottom-right vs top-left panel", "serial", dbg)
+    _SERIAL_CACHE[cache_key] = res
+    return res
 
 
 # ---------------------------------------- 8. Watermark window (normal light)
@@ -371,8 +477,101 @@ def check_watermark_backlit(trans, wm_refs=None):
         f"band contrast = {band_rel:.1f}%", None, vis)
 
 
-def run_all(note, refs, backlit=None, wm_refs=None):
+# ---------------------------------------------- 10. Issuer text (OCR of the whole note)
+# A copied DESIGN passes every image check (texture, reference match, ink), but a toy/prop note still prints its own words.
+# Genuine notes always read "RESERVE BANK OF INDIA". Only positive evidence counts: unreadable text is inconclusive.
+_PROP_WORDS = ("CHILDREN", "MANORANJAN", "CHURAN", "COUPON", "ENTERTAINMENT", "REPLICA", "DUMMY", "MOVIE", "TOY", "TOYS", "PROP", "FAKE")
+_ISSUER_CACHE = {}
+
+
+def _fuzzy(a, b):
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _is(tok, word, strict_short=True):
+    """Typo-tolerant word match; very short words must match exactly so OCR noise cannot create them."""
+    if len(word) <= 4 and strict_short:
+        return tok == word
+    return len(tok) >= 3 and _fuzzy(tok, word) >= 0.78
+
+
+def analyse_issuer_tokens(toks):
+    """-> (rbi_found, prop_hits, other_bank). Pure function of the OCR tokens (testable without Tesseract)."""
+    rbi, other_bank, props = False, False, []
+    for i, t in enumerate(toks):
+        if _is(t, "BANK", strict_short=False) and len(t) <= 5:
+            before, after = toks[max(0, i - 2):i], toks[i + 1:i + 3]
+            if any(_is(x, "RESERVE", False) for x in before) or any(_is(x, "INDIA", False) for x in after):
+                rbi = True
+            else:
+                other_bank = True
+                if before and _is(before[-1], "CHILDREN", False):
+                    props.append("'CHILDREN BANK'")
+        for p in _PROP_WORDS:
+            if _is(t, p) and f"'{p}'" not in props:
+                props.append(f"'{p}'")
+        if t == "FULL" and toks[i + 1:i + 3] == ["OF", "FUN"]:
+            props.append("'FULL OF FUN'")
+    return rbi, list(dict.fromkeys(props)), other_bank
+
+
+def _issuer_tokens(note_hr):
+    import pytesseract
+    h, w = note_hr.shape[:2]
+    toks_all = []
+    for img in (note_hr, cv2.rotate(note_hr, cv2.ROTATE_180)):            # the note may be upside-down
+        whole = cv2.resize(img, (1800, int(1800 * h / w)), interpolation=cv2.INTER_CUBIC)
+        best = max(cv2.split(whole), key=lambda c: c.std())                 # highest-contrast channel helps on tinted notes
+        for g in (cv2.cvtColor(whole, cv2.COLOR_BGR2GRAY), best):
+            try:
+                txt = pytesseract.image_to_string(g, config="--psm 11", timeout=10)
+            except Exception:
+                continue
+            toks = [t for t in re.sub(r"[^A-Z]", " ", txt.upper()).split() if len(t) >= 2]
+            toks_all.append(toks)
+            rbi, props, _ = analyse_issuer_tokens(toks)
+            if props or rbi:
+                return toks_all
+    return toks_all
+
+
+def check_issuer_text(note_hr):
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+    except Exception:
+        return CheckResult("Issuer text", None, "Skipped - install Tesseract + pytesseract to read the issuer text of the note.")
+    key = hashlib.md5(note_hr.tobytes()).hexdigest()
+    if key in _ISSUER_CACHE:
+        return _ISSUER_CACHE[key]
+    runs = _issuer_tokens(note_hr)
+    rbi = any(analyse_issuer_tokens(t)[0] for t in runs)
+    props = list(dict.fromkeys(p for t in runs for p in analyse_issuer_tokens(t)[1]))
+    other_bank = any(analyse_issuer_tokens(t)[2] for t in runs)
+    if props:
+        res = CheckResult("Issuer text", 0.0,
+                          "The note prints words that no Reserve Bank of India note carries: " + ", ".join(props) + ". "
+                          "This is a toy, prop or novelty note, not currency, even if its design copies a real note.",
+                          "toy/prop text: " + ", ".join(props), None, None, decisive=True)
+    elif rbi:
+        res = CheckResult("Issuer text", 1.0, "OCR found the issuer line 'RESERVE BANK OF INDIA' printed on the note.",
+                          "RESERVE BANK OF INDIA found")
+    elif other_bank:
+        res = CheckResult("Issuer text", 0.25, "A \"BANK\" line was read, but not \"RESERVE BANK OF INDIA\". Could be a different issuer, "
+                          "or a blurry photo - check by eye.", "issuer line differs")
+    else:
+        res = CheckResult("Issuer text", None, "Inconclusive - the issuer line could not be read (blur, glare or angle). "
+                          "Not counted: an unreadable photo is not evidence of a fake.", "not readable")
+    _ISSUER_CACHE[key] = res
+    return res
+
+
+def run_all(note, refs, backlit=None, wm_refs=None, note_hr=None, generic_only=False):
+    hr = note_hr if note_hr is not None else note
+    if generic_only:      # denomination without a calibrated profile: only checks that do not depend on the note's layout
+        return [check_sharpness(note), check_halftone(note), check_saturation(note, generic=True), check_issuer_text(hr)]
     return [check_security_thread(note), check_sharpness(note), check_halftone(note),
             check_saturation(note), check_texture(note, refs),
-            check_reference_match(note, refs), check_serial(note),
+            check_reference_match(note, refs), check_serial(hr), check_issuer_text(hr),
             check_watermark_window(note), check_watermark_backlit(backlit, wm_refs)]

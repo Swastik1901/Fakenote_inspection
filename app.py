@@ -7,11 +7,28 @@ import cv2
 import numpy as np
 import streamlit as st
 
-from detector import config as C
-from detector.pipeline import analyze, get_references
-from detector.gate import check_banknote
-from detector.preprocess import rectify
-from simulate_fake import photocopy, inkjet, lowres, print_watermark, backlit
+try:
+    from detector import config as C
+    from detector.checks import best_inliers
+    from detector.denomination import NOTES, NOT_IN_USE, OLD_500, STATUS_DATE, SOURCE_LABEL, identify_note
+    from detector.pipeline import (analyze, get_all_references, get_reference_sets, get_references, get_side_references, REF_DIR)
+    from detector.gate import check_banknote
+    from detector.imageio import load_image_bgr
+    from detector.preprocess import rectify
+    from simulate_fake import photocopy, inkjet, lowres, print_watermark, backlit
+    import detector as _detector
+    if getattr(_detector, "__version__", None) != "2026-10-28c":
+        raise ImportError(f"detector/__init__.py is version {getattr(_detector, '__version__', 'unknown')}, expected 2026-10-28c")
+    if "note_hr" not in rectify(np.zeros((40, 80, 3), np.uint8)):       # catches a stale preprocess.py
+        raise ImportError("detector/preprocess.py is out of date (no 'note_hr')")
+except ImportError as _e:      # app.py and the detector/ folder come from different versions
+    st.set_page_config(page_title="FakeNote Inspector", page_icon="💵")
+    st.error("**Your `detector/` folder does not match this `app.py`** (files from different versions).\n\n"
+             "Replace **every** file in `detector/` (`__init__`, `checks`, `config`, `denomination`, `gate`, `imageio`, `pipeline`, `preprocess`), "
+             "plus `app.py`, `simulate_fake.py` and the `references/` folder, with the ones from the latest `detector.zip`, "
+             "delete `detector/__pycache__`, then restart the server.\n\n"
+             f"Details: `{_e}`")
+    st.stop()
 
 st.set_page_config(page_title="FakeNote Inspector", page_icon="💵", layout="wide")
 
@@ -74,6 +91,12 @@ footer, #MainMenu {{visibility: hidden;}}
 .srow {{display: flex; gap: .6rem; font-size: .88rem; color: #cfcdc6;}}
 .srow .snm {{flex: 1;}} .srow .spc {{color: {MUTED}; font-variant-numeric: tabular-nums;}}
 
+.note.ok {{border-color: {GREEN}66;}} .note.bad {{border-color: {RED}99; background: #1c1517;}} .note.info {{border-color: rgba(255,255,255,.18);}}
+.note b {{color: #f3f1ea;}} .note ul {{color: #e9dcc0;}}
+.badge {{display: inline-block; padding: .18rem .7rem; margin-bottom: .55rem; border-radius: 99px; font-size: .72rem; font-weight: 700;
+        letter-spacing: .16em; color: #fff; background: {RED}; font-family: 'Inter', system-ui, sans-serif;}}
+.badge.warn {{background: {AMBER}; color: #20170a;}}
+
 /* sidebar */
 [data-testid="stSidebar"] {{border-right: 1px solid rgba(255,255,255,.06);}}
 [data-testid="stSidebar"] h3 {{font-size: .72rem; letter-spacing: .2em; color: {GOLD}; text-transform: uppercase; margin-top: 1rem;}}
@@ -93,6 +116,12 @@ def show(a, **kw):
 
 rgb = lambda a: cv2.cvtColor(a, cv2.COLOR_BGR2RGB) if a.ndim == 3 else a
 tone = lambda s: GREEN if s >= 0.65 else (AMBER if s >= 0.4 else RED)
+
+def banner_html(b, extra=""):
+    badge = f'<span class="badge {b["kind"]}">{b["badge"]}</span><br>' if b.get("badge") else ""
+    return (f'<div class="note {b["kind"]}">{badge}<b>{b["title"]}</b><br>{b["text"]}{extra}'
+            f'<br><span style="opacity:.6;font-size:.78rem">{STATUS_DATE}</span></div>')
+
 
 def scan_html(pct, status, done):
     rows = ""
@@ -142,7 +171,7 @@ st.markdown(
 with st.sidebar:
     st.markdown("### Input")
     mode = st.radio("Source", ["Upload", "Webcam"], horizontal=True, label_visibility="collapsed")
-    file = st.file_uploader("Note photo", type=["jpg", "jpeg", "png"], label_visibility="collapsed") \
+    file = st.file_uploader("Note photo", type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"], label_visibility="collapsed") \
         if mode == "Upload" else st.camera_input("Take a photo", label_visibility="collapsed")
     cropped = st.toggle("Image is already a cropped note", value=False,
                         help="Skip note detection when the photo contains only the note.")
@@ -167,8 +196,23 @@ with st.sidebar:
         s_at = st.slider("Suspicious if score ≥", 0.10, g_at, min(C.SUSPICIOUS_AT, g_at), 0.01)
     with st.expander("Enabled checks"):
         weights = {k: (1.0 if st.checkbox(k, True) else 0.0) * v for k, v in C.WEIGHTS.items()}
+    with st.expander("Genuine reference images"):
+        st.caption("Add a sharp, flat, full-note photo of a genuine ₹500. Use a **different** photo from the one you test, "
+                   "otherwise the match is trivially perfect.")
+        new_refs = st.file_uploader("Add reference", type=["jpg", "jpeg", "png"], accept_multiple_files=True,
+                                    key="refup", label_visibility="collapsed")
+        for f in new_refs or []:
+            REF_DIR.mkdir(exist_ok=True)
+            (REF_DIR / f.name).write_bytes(f.getvalue())
+            if file is not None and f.getvalue() == file.getvalue():
+                st.warning(f"{f.name} is the same photo you are testing. Use a different one.")
+        if st.button("Remove all references"):
+            for p in REF_DIR.glob("*"):
+                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                    p.unlink()
+            st.rerun()
     refs = get_references()
-    st.caption(f"{len(refs)} genuine reference image(s) in references/")
+    st.caption(f"{len(refs)} reference image(s) for the ₹500 in references/")
 
 # ------------------------------------------------------------------ empty state
 if file is None:
@@ -186,7 +230,14 @@ if file is None:
 key = hashlib.md5(file.getvalue()).hexdigest() + "|".join(
     str(v) for v in (attack, wm_sim, cropped, getattr(wm_file, "name", None), getattr(wm_file, "size", None)))
 new_input = st.session_state.get("scan_key") != key      # thresholds/weights changes do not replay it
-img = cv2.imdecode(np.frombuffer(file.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+img = load_image_bgr(file.getvalue())
+if img is None:                                          # unreadable / corrupt / unsupported file: say so instead of crashing
+    st.session_state["scan_key"] = key
+    st.markdown('<div class="note bad"><b>This file could not be read as an image.</b><br>'
+                f'<code>{html.escape(getattr(file, "name", "upload"))}</code> is probably corrupt or in a format that was only renamed to .png/.jpg '
+                '(AVIF, HEIC, a web page saved as an image, ...). Open it, export it again as a normal PNG or JPG and upload that.</div>',
+                unsafe_allow_html=True)
+    st.stop()
 # Attacks are applied to the NOTE itself (straightened first), like photocopying a real note,
 # so the checks stay aligned and only the genuine effect of the attack is measured.
 fn = {"Photocopy": photocopy, "Inkjet reprint": inkjet, "Low-res scan": lowres,
@@ -195,12 +246,31 @@ img0 = img.copy()
 r0 = rectify(img)
 base = r0["note"] if (r0["found"] or cropped) else None      # None -> no note in the image
 pre_rect = False
-if fn and base is not None:
-    img, pre_rect = fn(base), True
 
-# ---- is it a banknote at all? (checked on the original, before any simulated attack)
+# ---- which note is it? Read the printed amount (needs Tesseract), then check it is a note at all
 cand = r0["note"] if r0["found"] else (img0 if cropped else None)
-if gate_on and cand is not None:
+amount, amount_conf, amount_src = None, 0.0, None
+if cand is not None:
+    with st.spinner("Reading the note…"):
+        hr = r0["note_hr"] if r0["found"] else cv2.resize(img0, (2 * C.NOTE_W, 2 * C.NOTE_H), interpolation=cv2.INTER_CUBIC)
+        # printed amount (needs Tesseract) -> design match against references/<value>/ -> dominant colour
+        ident = identify_note(hr, cv2.resize(cand, (C.NOTE_W, C.NOTE_H), interpolation=cv2.INTER_AREA), get_reference_sets())
+        amount, amount_conf, amount_src = ident["value"], ident["conf"], ident["source"]
+# ---- front or back? (before the colour gate: the back of a lavender/magenta note would otherwise look "off-palette")
+side_refs = get_side_references()
+if cand is not None and side_refs:
+    cand_n = cv2.resize(cand, (C.NOTE_W, C.NOTE_H), interpolation=cv2.INTER_AREA)
+    rev_in, any_obv = best_inliers(cand_n, side_refs), best_inliers(cand_n, get_all_references())
+    if rev_in >= 15 and rev_in > 2 * max(any_obv, 1):
+        st.session_state["scan_key"] = key
+        left, right = st.columns([1, 1.2], gap="large")
+        with left:
+            st.markdown('<div class="note"><b>This is the back of the note.</b><br>It matches the reverse side of a note we have a '
+                        'specimen for. Please upload a photo of the <b>front</b> (the side with the portrait).</div>', unsafe_allow_html=True)
+        with right:
+            show(rgb(img0), caption="Uploaded image")
+        st.stop()
+if gate_on and cand is not None and amount_src not in ("text", "design"):    # a read amount / matched design proves it is a note, whatever its colours
     gate = check_banknote(cand, None if r0["found"] else max(img0.shape[:2]) / min(img0.shape[:2]))
     if not gate["ok"]:
         if animate and new_input:
@@ -211,21 +281,40 @@ if gate_on and cand is not None:
             why = "".join(f"<li>{html.escape(r)}</li>" for r in gate["reasons"])
             st.markdown('<div class="note"><b>This does not look like a banknote.</b>'
                         f'<ul style="margin:.6rem 0 .6rem 1.1rem;padding:0">{why}</ul>'
-                        'Upload a photo of the note itself. This build is tuned for the ₹500 Mahatma Gandhi series. '
+                        'Upload a photo of the note itself. The denomination is read from the printed amount '
+                        '("THE SUM OF ... RUPEES", needs Tesseract), recognised from the references/ folder, or estimated from the colour. '
                         'Turn off <i>Reject non-banknote images</i> in the sidebar to analyse it anyway.</div>',
                         unsafe_allow_html=True)
         with right:
             show(rgb(img0), caption="Uploaded image")
         st.stop()
 
+# ---- which side, which design, what status?
+banner, limited = None, False
+profile = amount if amount in C.PROFILES else 500                 # layout profile (the Rs 500 one when the amount is unknown)
+C.set_profile(profile)
+refs = get_references(profile)                                    # genuine references of THIS denomination
+obv_in = 0
+if cand is not None and refs:
+    obv_in = best_inliers(cv2.resize(cand, (C.NOTE_W, C.NOTE_H), interpolation=cv2.INTER_AREA), refs)
+if amount == 500 and refs and obv_in < 10:
+    banner = OLD_500
+elif amount in NOTES:
+    banner = NOTES[amount]
+    limited = amount not in C.PROFILES                           # no layout profile (e.g. the withdrawn Rs 1000) -> generic checks only
+
+# ---- simulated attack on the straightened note (uses the active denomination profile)
+if fn and base is not None:
+    img, pre_rect = fn(base), True
+
 backlit_img = None
 if wm_file is not None:
-    backlit_img = cv2.imdecode(np.frombuffer(wm_file.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+    backlit_img = load_image_bgr(wm_file.getvalue())
 elif wm_sim != "Off":
     backlit_img = backlit(base if base is not None else img, "genuine" if wm_sim == "Genuine watermark" else "none")
 
 with st.spinner("Analysing security features..."):
-    res = analyze(img, refs, weights, g_at, s_at, backlit_bgr=backlit_img, assume_cropped=pre_rect)
+    res = analyze(img, refs, weights, g_at, s_at, backlit_bgr=backlit_img, assume_cropped=pre_rect, limited=limited, profile=profile)
 
 # ------------------------------------------------------------------ no note found
 if not res["note_found"] and not cropped:
@@ -250,7 +339,7 @@ st.session_state["scan_key"] = key
 # ------------------------------------------------------------------ verdict
 active = [r for r in res["results"] if r.score is not None]
 passed = sum(r.passed for r in active)
-col = {"GENUINE": GREEN, "SUSPICIOUS": AMBER}.get(res["verdict"], RED)
+col = {"GENUINE": GREEN, "NO RED FLAGS": GREEN, "SUSPICIOUS": AMBER}.get(res["verdict"], RED)
 circ = 2 * np.pi * 52
 pct = int(round(res["score"] * 100))
 gauge = f"""
@@ -272,12 +361,35 @@ for r in res["results"]:
                  f'<div class="bar"><div style="width:{r.score*100:.0f}%;background:{tone(r.score)}"></div></div>'
                  f'<div class="pc">{r.score*100:.0f}%</div></div>')
 
+if banner:
+    extra = ""
+    if limited:
+        extra = ("<br><br>There is no layout profile for this denomination, so just the three generic print checks "
+                 "(sharpness, halftone, ink) ran. They can show signs of copying but cannot confirm the note.")
+    elif amount in C.PROFILES and not C.PROFILES[amount]["validated"]:
+        extra = ("<br><br>The layout profile for this denomination was measured from the official RBI specimen only and has not been "
+                 "validated on real photos, so the verdict is limited to <i>No red flags</i> or <i>Suspicious</i>.")
+    if amount in NOT_IN_USE:
+        extra += "<br><br>The analysis below only judges how the note was printed. It does not change the note's status above."
+    if amount_src in ("design", "colour"):
+        extra += f"<br><br><span style='opacity:.75;font-size:.85rem'>Denomination {SOURCE_LABEL[amount_src]}.</span>"
+    st.markdown(banner_html(banner, extra), unsafe_allow_html=True)
+    st.write("")
+if res.get("decisive"):
+    why = "".join(f"<li><b>{html.escape(n)}</b>: {html.escape(d)}</li>" for n, d in res["decisive"])
+    st.markdown(f'<div class="note bad"><span class="badge">COUNTERFEIT EVIDENCE</span>'
+                f'<ul style="margin:.4rem 0 .6rem 1.1rem;padding:0">{why}</ul>'
+                '<span style="opacity:.75;font-size:.85rem">The verdict and the low score come from this evidence, not from averaging the checks. '
+                'The other checks below can still be green because a toy or counterfeit note can copy the design of a real one; '
+                'they only show that the design matches, not that the note is genuine.</span></div>', unsafe_allow_html=True)
+    st.write("")
 left, right = st.columns([1, 1.25], gap="large")
 with left:
     st.markdown(
         f'<div class="vcard">{gauge}<div><div class="lbl">Verdict</div>'
         f'<div class="word" style="color:{col}">{res["verdict"].title()}</div>'
-        f'<div class="sub">{passed} of {len(active)} checks passed</div></div></div>'
+        f'<div class="sub">{passed} of {len(active)} checks passed'
+        f'{"<br>verdict set by decisive evidence" if res.get("decisive") else ""}</div></div></div>'
         f'<div class="clist">{rows}</div>', unsafe_allow_html=True)
 with right:
     show(rgb(res["annotated"]), caption="Rectified note. Green regions passed, red regions failed.")
@@ -306,7 +418,9 @@ with t2:
     st.caption("Input → edges → contour → 4-corner fit → perspective warp → 7 checks → weakest-link fusion → verdict")
 
 with t3:
-    report = {"verdict": res["verdict"], "score": round(res["score"], 3),
+    report = {"denomination": amount, "denomination_source": amount_src,
+              "status": banner["title"] if banner else None,
+              "verdict": res["verdict"], "score": round(res["score"], 3),
               "checks": [{"name": r.name, "score": None if r.score is None else round(r.score, 3),
                           "metric": r.metric, "detail": r.detail} for r in res["results"]]}
     st.json(report, expanded=False)

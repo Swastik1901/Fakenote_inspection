@@ -73,6 +73,39 @@ def _dash_count(mask, h, w):
     return len(best), float(cover), best
 
 
+def _recount_on_line(gray, x_off, blobs, h, w):
+    """Blob detection misses dashes sitting on dark/coloured artwork (low contrast). Once two or more strong dashes fix the
+    thread's line, walk down that line and count every stretch that is darker than the paper on both sides of it.
+    Returns (count, covered_rows_fraction, runs[(y0, y1)])."""
+    if len(blobs) < 2:
+        return len(blobs), 0.0, []
+    ys = np.array([b[1] for b in blobs]); xs = np.array([b[0] + x_off for b in blobs])
+    a, b0 = np.polyfit(ys, xs, 1)
+    mw = max(int(np.median([b[3] for b in blobs])), 4)
+    prof = np.zeros(h, np.float32)
+    for y in range(h):
+        cx = int(round(a * y + b0))
+        c0, c1 = cx - mw // 2, cx + mw // 2 + 1
+        if c0 - mw - 6 < 0 or c1 + mw + 6 > w:
+            continue
+        centre = gray[y, c0:c1].mean()
+        side = 0.5 * (gray[y, c0 - mw - 6:c0 - 6].mean() + gray[y, c1 + 6:c1 + mw + 6].mean())
+        prof[y] = side - centre                        # > 0: darker than its surroundings
+    prof = np.convolve(prof, np.ones(5) / 5, mode="same")
+    on = prof > 14
+    runs, y = [], 0
+    while y < h:
+        if on[y]:
+            y0 = y
+            while y < h and on[y]:
+                y += 1
+            if y - y0 >= 0.022 * h and y0 > 0.03 * h and y < 0.97 * h:    # at least ~2% of the height; the very edge rows are border/margin, not thread
+                runs.append((y0, y))
+        else:
+            y += 1
+    return len(runs), float(sum(y1 - y0 for y0, y1 in runs)) / h, runs
+
+
 def check_security_thread(note):
     """Genuine Rs 500 notes carry a windowed thread: continuous in transmitted light, but in reflected light it shows
     as a column of dark dashes. Score the better of (a) one continuous line, (b) several aligned dashes."""
@@ -98,6 +131,11 @@ def check_security_thread(note):
     bh = cv2.morphologyEx(g8, cv2.MORPH_BLACKHAT, kern)[:, x0:x1]       # dark features narrower than the kernel
     th = cv2.morphologyEx(g8, cv2.MORPH_TOPHAT, kern)[:, x0:x1]         # bright features narrower than the kernel
     dashes, cover, blobs = max((_dash_count(m, h, w) for m in (bh > 22, th > 22)), key=lambda t: t[0])
+    runs = []
+    if dashes >= 2:                                   # re-count along the fitted line: finds dashes the blob filter lost on dark art
+        n2, cover2, runs = _recount_on_line(gray, x0, blobs, h, w)
+        if n2 > dashes:
+            dashes, cover = n2, max(cover, cover2)
     s_cont = _scale(best_val, *C.THREAD_CONT_RANGE)
     s_dash = _scale(dashes, 2, 5) * _scale(cover, 0.05, 0.15)
     score = max(s_cont, s_dash)
@@ -106,6 +144,9 @@ def check_security_thread(note):
     cv2.line(dbg, (x0 + best, 0), (x0 + best, h), (0, 255, 255), 1)
     for cx, cy, bh, bw in blobs:                      # show exactly which dashes were counted
         cv2.rectangle(dbg, (int(x0 + cx - bw / 2) - 3, int(cy - bh / 2)), (int(x0 + cx + bw / 2) + 3, int(cy + bh / 2)), (255, 200, 0), 3)
+    for y0, y1 in runs:                               # recounted dashes in orange
+        bx = int(x0 + np.mean([b[0] for b in blobs]))
+        cv2.rectangle(dbg, (bx - 12, y0), (bx + 12, y1), (0, 160, 255), 2)
     return CheckResult(
         "Security thread", score,
         f"Strongest vertical line is continuous over {best_val*100:.0f}% of the note height, or shows {dashes} aligned "
@@ -158,11 +199,13 @@ def check_halftone(note):
     vis = cv2.applyColorMap(cv2.resize(vis, (384, 384), interpolation=cv2.INTER_NEAREST), cv2.COLORMAP_MAGMA)
 
     score = 1.0 - _scale(ratio, *C.HALFTONE_RANGE)
-    return CheckResult(
-        "Halftone / moire", score,
-        "Inkjet/laser reproductions are built from regular dot grids, which show up as sharp "
-        "isolated peaks in the frequency spectrum. Genuine print gives a smooth spectrum.",
-        f"peak/median = {ratio:.1f}", None, vis)
+    decisive = ratio >= C.HALFTONE_DECISIVE
+    detail = ("Inkjet/laser reproductions are built from regular dot grids, which show up as sharp "
+              "isolated peaks in the frequency spectrum. Genuine print gives a smooth spectrum.")
+    if decisive:
+        detail = (f"A printer's dot grid is unmistakable here (peak/median {ratio:.0f}, genuine notes stay far below {C.HALFTONE_DECISIVE:.0f}). "
+                  "This is a reprint. If you photographed a screen instead of the paper note, retake the photo of the note itself.")
+    return CheckResult("Halftone / moire", 0.0 if decisive else score, detail, f"peak/median = {ratio:.1f}", None, vis, decisive=decisive)
 
 
 # -------------------------------------------------------------- 4. Saturation
@@ -182,11 +225,15 @@ def check_saturation(note, generic=False):
         col = cv2.cvtColor(np.uint8([[[i, 255, 255]]]), cv2.COLOR_HSV2BGR)[0, 0].tolist()
         hgt = int(min(hue[i] * 120 * 12, 118))
         cv2.rectangle(vis, (i * 2, 119 - hgt), (i * 2 + 1, 119), col, -1)
-    return CheckResult(
-        "Ink saturation", score,
-        "Genuine notes carry vivid green/olive ink. Black & white photocopies and washed-out prints have none, "
-        "even when the paper looks tinted. Judged on the ink itself, so a grey-looking phone photo is not penalised.",
-        f"green ink = {ink_pct:.1f}% of pixels, mean S = {mean_s:.0f}/255", None, vis)
+    no_colour = mean_s < C.NO_COLOUR_S
+    detail = ("Genuine notes carry the vivid ink of their denomination (olive-green on the Rs 500, lavender on the Rs 100, magenta on the Rs 2000, ...). "
+              "Black & white photocopies and washed-out prints have none, even when the paper looks tinted. Judged on the ink itself, "
+              "so a grey-looking phone photo is not penalised.")
+    if no_colour:
+        detail = (f"The image has no colour at all (mean saturation {mean_s:.0f}/255) and every Indian note is printed in colour, so this is a "
+                  "black-and-white photocopy or a grayscale conversion. If it is a photo of a real note, upload the colour original.")
+    return CheckResult("Ink saturation", 0.0 if no_colour else score, detail,
+                       f"note ink = {ink_pct:.1f}% of pixels, mean S = {mean_s:.0f}/255", None, vis, decisive=no_colour)
 
 
 # ------------------------------------------------------------ 5. LBP texture
@@ -200,8 +247,13 @@ def _lbp(gray):
     return code
 
 
+LBP_WIDTH = 128
+
+
 def _lbp_hist(note):
     roi = _crop(cv2.cvtColor(note, cv2.COLOR_BGR2GRAY), C.ROIS["portrait"])
+    # fixed analysis width: LBP is resolution-sensitive, so a 1600 px scan and a 776 px reference must be compared at the same scale
+    roi = cv2.resize(roi, (LBP_WIDTH, max(int(LBP_WIDTH * roi.shape[0] / max(roi.shape[1], 1)), 8)), interpolation=cv2.INTER_AREA)
     code = _lbp(roi)
     hist = np.bincount(code.ravel(), minlength=256).astype(np.float64)
     return code, hist / hist.sum()
@@ -424,11 +476,14 @@ def check_watermark_window(note):
     gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (0, 0), 1.2)
     edges = cv2.Canny(gray, 25, 75)
     density = float((edges > 0).mean())
-    return CheckResult(
-        "Watermark window", 1.0 - _scale(density, *C.WM_EDGE_RANGE),
-        "In normal light the watermark window of a genuine note is blank - the portrait only shows "
-        "against light. A visibly printed portrait or pattern here is a classic counterfeit sign.",
-        f"edge density = {density*100:.1f}%", "watermark", cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR))
+    decisive = density >= C.WM_EDGE_DECISIVE and C.PROFILE_VALIDATED       # the window position is only trustworthy on a validated layout
+    detail = ("In normal light the watermark window of a genuine note is blank - the portrait only shows "
+              "against light. A visibly printed portrait or pattern here is a classic counterfeit sign.")
+    if decisive:
+        detail = ("A portrait or pattern is printed in the watermark window, visible in normal light. A real watermark is only visible against "
+                  "light, so this is a classic counterfeit trick. (Check there is no crease, finger or glare on the window.)")
+    return CheckResult("Watermark window", 0.0 if decisive else 1.0 - _scale(density, *C.WM_EDGE_RANGE), detail,
+                       f"edge density = {density*100:.1f}%", "watermark", cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR), decisive=decisive)
 
 
 # ------------------------------------------- 9. Watermark (transmitted light)

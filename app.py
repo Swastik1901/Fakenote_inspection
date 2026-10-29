@@ -17,8 +17,8 @@ try:
     from detector.preprocess import rectify
     from simulate_fake import photocopy, inkjet, lowres, print_watermark, backlit
     import detector as _detector
-    if getattr(_detector, "__version__", None) != "2026-10-28c":
-        raise ImportError(f"detector/__init__.py is version {getattr(_detector, '__version__', 'unknown')}, expected 2026-10-28c")
+    if getattr(_detector, "__version__", None) != "2026-10-28d":
+        raise ImportError(f"detector/__init__.py is version {getattr(_detector, '__version__', 'unknown')}, expected 2026-10-28d")
     if "note_hr" not in rectify(np.zeros((40, 80, 3), np.uint8)):       # catches a stale preprocess.py
         raise ImportError("detector/preprocess.py is out of date (no 'note_hr')")
 except ImportError as _e:      # app.py and the detector/ folder come from different versions
@@ -161,7 +161,7 @@ def play_scan(results):
 
 # ------------------------------------------------------------------ header
 st.markdown(
-    '<div class="eyebrow">Currency forensics &middot; classical image processing</div>'
+    '<div class="eyebrow">Currency forensics</div>'
     '<div class="title">FakeNote Inspector</div>'
     '<div class="tagline">Every security feature of the note is checked on its own and shown with evidence. '
     'No black box, just explainable computer vision.</div><div class="rule"></div>',
@@ -250,12 +250,14 @@ pre_rect = False
 # ---- which note is it? Read the printed amount (needs Tesseract), then check it is a note at all
 cand = r0["note"] if r0["found"] else (img0 if cropped else None)
 amount, amount_conf, amount_src = None, 0.0, None
+amount_votes, amount_veto = {}, None
 if cand is not None:
     with st.spinner("Reading the note…"):
         hr = r0["note_hr"] if r0["found"] else cv2.resize(img0, (2 * C.NOTE_W, 2 * C.NOTE_H), interpolation=cv2.INTER_CUBIC)
         # printed amount (needs Tesseract) -> design match against references/<value>/ -> dominant colour
         ident = identify_note(hr, cv2.resize(cand, (C.NOTE_W, C.NOTE_H), interpolation=cv2.INTER_AREA), get_reference_sets())
         amount, amount_conf, amount_src = ident["value"], ident["conf"], ident["source"]
+        amount_votes, amount_veto = ident.get("votes", {}), ident.get("vetoed")
 # ---- front or back? (before the colour gate: the back of a lavender/magenta note would otherwise look "off-palette")
 side_refs = get_side_references()
 if cand is not None and side_refs:
@@ -373,6 +375,10 @@ if banner:
         extra += "<br><br>The analysis below only judges how the note was printed. It does not change the note's status above."
     if amount_src in ("design", "colour"):
         extra += f"<br><br><span style='opacity:.75;font-size:.85rem'>Denomination {SOURCE_LABEL[amount_src]}.</span>"
+    if amount_votes:
+        extra += ("<br><span style='opacity:.6;font-size:.78rem'>Denomination votes: "
+                  + ", ".join(f"₹{v}: {w:.2f}" for v, w in sorted(amount_votes.items(), key=lambda kv: -kv[1]))
+                  + (f" (design match for ₹{amount_veto} ignored: the note's colour contradicts it)" if amount_veto else "") + "</span>")
     st.markdown(banner_html(banner, extra), unsafe_allow_html=True)
     st.write("")
 if res.get("decisive"):

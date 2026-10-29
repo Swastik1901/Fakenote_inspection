@@ -1,215 +1,217 @@
 # FakeNote Inspector
 
-A Streamlit app that inspects a photo of an Indian banknote and explains, check by check, whether it looks genuine.
-It uses classical computer vision (OpenCV, FFT, feature matching, OCR). There is no black-box model: every score comes with
-the measurement and a picture of the evidence.
+**An explainable fake-currency screening tool for Indian banknotes, built with classical computer vision. No black box, no trained model.**
 
-> **Screening aid only.** A phone camera cannot capture UV, microprinting or the feel of the paper. A note that looks
-> suspicious should be verified by a bank.
+Upload (or photograph) a banknote and the app checks each security and print feature on its own, shows the evidence for every check, and gives a final verdict with a 0 to 100 authenticity score.
+
+> **Screening aid only.** A phone camera cannot see UV features, microprinting or the feel of raised ink. Never use this tool as the only basis to accept or reject real money. For a final answer, check the note against the RBI's published security features or take it to a bank.
 
 ---
 
-## 1. Quick start
+## 1. What does it do? (in simple words)
+
+You give it a photo of a note. It then asks ten simple questions, the same way a person would examine a note:
+
+| # | Check | The question it asks | How (simple) |
+|---|-------|----------------------|--------------|
+| 1 | **Security thread** | Is there a thread running top to bottom? | Looks for a line of dark dashes (or one continuous line) near the thread position, and counts the dashes |
+| 2 | **Print sharpness** | Are the fine lines crisp, like real printing? | Laplacian variance (how much sharp edge detail there is). Photocopies are blurrier |
+| 3 | **Halftone / moire** | Is the picture made of printer dots? | FFT (frequency analysis). A home printer's dot grid shows up as sharp spikes |
+| 4 | **Ink saturation** | Does it have the real coloured ink? | HSV colour analysis. A black and white photocopy has almost no colour |
+| 5 | **Intaglio texture** | Does the portrait have the raised-ink texture? | LBP (Local Binary Pattern) texture compared with a genuine reference |
+| 6 | **Reference match** | Does the whole design match a genuine note? | ORB feature matching plus RANSAC geometry check |
+| 7 | **Serial number** | Is the serial number printed twice, and do both copies agree? | OCR on both number panels |
+| 8 | **Issuer text** | Does it say "RESERVE BANK OF INDIA"? Any toy words like "CHILDREN BANK"? | OCR on the whole note |
+| 9 | **Watermark window** | Is the watermark window blank in normal light? | Edge density. A printed portrait there is a classic counterfeit trick |
+| 10 | **Watermark (backlit)** | Does a soft portrait show when the note is held to light? | Optional second photo, band-pass filtering |
+
+Each check gives a score from 0 to 1. The scores are combined into the final verdict.
+
+---
+
+## 2. Features
+
+### Analysis
+- **10 independent checks** (above), each with a score, the measured value, a plain-language explanation and a debug image as proof.
+- **Automatic note detection and straightening.** Finds the note in the photo (edges, contour, 4 corners) and flattens the perspective. If the image is already a cropped note, this is detected automatically.
+- **Denomination detection** (₹100, ₹500, ₹1000, ₹2000, and others for the status banner) using a *voting* system:
+  - printed amount words read by OCR (strongest),
+  - design match against reference images (ORB),
+  - dominant colour (only for notes with a unique tint: lavender ₹100, magenta ₹2000),
+  - big numerals read by OCR (weakest, because OCR often drops digits).
+
+  Votes add up. A design match is ignored if the note's colour clearly contradicts it. The app shows the votes, so a wrong call can be explained.
+- **Status banner.** Tells you if a note is demonetised or withdrawn (₹1000 demonetised on 8 Nov 2016; ₹2000 withdrawn from circulation on 19 May 2023 but still legal tender; old pre-2016 ₹500 not valid).
+- **"Is this even a banknote?" gate.** Rejects screenshots, photos, blank images and wrong shapes, but never rejects a black and white photocopy (that should be flagged as fake instead).
+- **Front/back detection** using reverse-side reference images in `references/sides/` (optional).
+
+### Smart decision making
+- **Weakest-link fusion.** Final score = 60% weighted average + 40% average of the two lowest checks. One badly failed check cannot hide behind many good ones.
+- **Decisive evidence.** Some findings are proof by themselves and override the average:
+  - a printer's dot grid (halftone peak ratio of 250 or more),
+  - no colour at all (a black and white copy),
+  - a portrait printed in the watermark window (validated layouts only),
+  - toy/prop words found by OCR ("CHILDREN BANK", "REPLICA", "FAKE" ...).
+- **Consensus rule.** "Likely Fake" needs at least 3 failed checks, unless there is decisive evidence. One or two odd checks (glare, bad light) only give "Suspicious".
+- **Honest limits.** Checks that cannot read something (blurry serial number, unreadable text) are marked *inconclusive* and are **not counted** against the note.
+- **Capped verdicts for unvalidated denominations.** Layouts that were only measured from an official specimen can say "No red flags" or "Suspicious", never "Genuine" or "Likely Fake".
+
+### Demo and testing tools
+- **Attack simulator** in the sidebar: photocopy, inkjet reprint, low-res scan, printed fake watermark. Watch the verdict react live.
+- **Backlit watermark simulator** (demo only) and a real "upload backlit photo" option.
+- **Adjustable thresholds and weights**, and a switch for each check.
+- **Add your own genuine reference images** from the sidebar.
+- **Evidence tab** (what was measured, with debug images), **Pipeline tab** (edges, outline, straightened note) and **Report tab** (JSON download).
+- **Step-by-step analysis animation** showing each check ticking off.
+- **Webcam input** as well as file upload. Reads many formats including WebP, BMP, TIFF and iPhone HEIC.
+- **Dark, clean UI** with a score gauge, per-check bars, and an annotated note (green boxes passed, red boxes failed).
+
+---
+
+## 3. Technology
+
+| Part | Tool |
+|------|------|
+| Language | Python 3 |
+| Image processing | **OpenCV** (`opencv-python`) |
+| Numbers and maths | **NumPy** |
+| Web app / UI | **Streamlit** |
+| Image loading fallback | **Pillow**, plus optional **pillow-heif** for HEIC/AVIF |
+| Text reading (OCR) | **Tesseract** via **pytesseract** (optional, but needed for serial number, issuer text and amount words) |
+
+### Computer vision techniques used (and where)
+- **Canny edges, contours, `approxPolyDP`, perspective warp**: finding and straightening the note.
+- **Morphology (black-hat / top-hat, opening, closing) and connected components**: finding thread dashes; **line fitting** to count dashes that sit on dark artwork.
+- **Laplacian variance**: print sharpness at a fixed width (so photo resolution does not matter).
+- **FFT with a Hann window**: detecting halftone dot grids.
+- **HSV colour space**: ink colour and colour-based denomination guess.
+- **Local Binary Patterns (LBP) + histogram intersection**: intaglio micro-texture (compared at a fixed size so scan resolution does not matter).
+- **ORB features + Brute-Force matcher + ratio test + RANSAC homography**: design matching.
+- **Tesseract OCR with fuzzy matching** (`difflib`): serial numbers, issuer text, amount words; look-alike character correction (0/O, 1/I, 5/S ...).
+- **Gaussian band-pass and template matching (NCC)**: watermark in transmitted light.
+
+No machine learning model is trained. Every number comes from a formula you can explain.
+
+---
+
+## 4. How it works (pipeline)
+
+```
+Photo
+  -> load (any format)
+  -> find note outline (edges -> contour -> 4 corners)
+  -> straighten to 1000 x 440 px
+  -> read denomination (OCR words + design match + colour + numerals, voting)
+  -> "is it a banknote?" gate + front/back check
+  -> pick the layout profile for that denomination
+  -> run the 10 checks
+  -> weakest-link fusion + decisive-evidence override + consensus rule
+  -> verdict + score + annotated image + evidence
+```
+
+---
+
+## 5. Project structure
+
+```
+app.py                  Streamlit user interface
+detector/
+  __init__.py           version stamp (app refuses to run if folders are mismatched)
+  config.py             all tunable settings + per-denomination layout profiles
+  preprocess.py         find the note and straighten it
+  gate.py               "is this a banknote at all?" test
+  checks.py             the 10 checks
+  denomination.py       which note is it? voting + status banners
+  pipeline.py           runs everything, fuses scores, draws annotations
+  imageio.py            robust image loading
+references/             genuine reference images (references/<value>/ per denomination)
+simulate_fake.py        makes fake test images (photocopy, inkjet, low-res, printed watermark)
+evaluate.py             accuracy / confusion matrix on dataset/genuine and dataset/fake
+watermark_probe.py      helps calibrate the backlit watermark range
+requirements.txt
+```
+
+---
+
+## 6. Setup and run
 
 ```bash
+# 1. Python packages
 pip install -r requirements.txt
-brew install tesseract          # macOS. Strongly recommended (see section 4)
+
+# 2. (Recommended) Tesseract OCR engine, needed for serial number, issuer text and amount reading
+#    macOS:   brew install tesseract
+#    Ubuntu:  sudo apt install tesseract-ocr
+#    Windows: install from the UB Mannheim build and add it to PATH
+
+# 3. Start the app
 streamlit run app.py
 ```
 
-The app opens at `http://localhost:8501`. Upload a photo, or use the webcam.
+Then open <http://localhost:8501>. Without Tesseract the app still works; the OCR-based checks are simply skipped and the denomination falls back to design match or colour.
 
-If you change files while the server is running, stop it (Ctrl+C) and start it again. After replacing anything in
-`detector/`, delete `detector/__pycache__/` first.
+**Tips for good photos:** whole note in frame, flat, plain background, even light, no glare, sharp focus.
 
----
-
-## 2. Project layout
-
-```
-fakenote 2/
-├── app.py                  Streamlit UI (upload, verdict, evidence, report)
-├── requirements.txt
-├── simulate_fake.py        Builds simulated fakes (photocopy, inkjet, low-res, printed watermark)
-├── watermark_probe.py      Prints watermark metrics so you can calibrate WM_BAND_RANGE
-├── evaluate.py             Calibrate thresholds on your own dataset
-├── detector/
-│   ├── __init__.py         Version stamp (app.py refuses to run with a mismatched detector/ folder)
-│   ├── config.py           All tunable numbers: regions, weights, thresholds, per-denomination profiles
-│   ├── imageio.py          Robust image loading (WebP/AVIF/GIF/ICO, transparency, 16-bit, corrupt files)
-│   ├── preprocess.py       Finds the note in the photo and straightens it (perspective correction)
-│   ├── gate.py             "Is this a banknote at all?" pre-check
-│   ├── denomination.py     Which note is it, and is it still in use? (text, design, colour)
-│   ├── checks.py           The individual checks (one function per security feature)
-│   └── pipeline.py         Runs the checks, fuses the scores, produces the verdict
-└── references/
-    ├── *.jpg / *.png       Genuine ₹500 reference photos
-    ├── 1000/               Genuine references for other denominations (folder name = value)
-    ├── 100/  2000/ ...
-    ├── sides/              Reverse sides, so a back-of-note upload is recognised as such
-    └── watermark/          Optional backlit photos of genuine watermarks
-```
+If you see a "detector/ folder does not match this app.py" message, replace *every* file in `detector/`, delete `detector/__pycache__`, and restart.
 
 ---
 
-## 3. How a photo is processed
-
-1. **Load.** The file is decoded by OpenCV, with Pillow as a fallback. An unreadable file gets a clear message
-   instead of a crash.
-2. **Find and straighten the note.** Edges, contour, four-corner fit, perspective warp to a fixed 1000 x 440 canvas.
-   Tick *Image is already a cropped note* if the photo contains only the note.
-3. **Front or back?** Compared with the reverse-side references in `references/sides/`.
-4. **Which note?** See section 5.
-5. **Banknote gate.** Rejects obvious non-notes (photos, screenshots, blank images). It only runs when the denomination
-   was not already proven by the printed text or a matching reference.
-6. **Checks.** See the table below.
-7. **Fusion and verdict.** See section 6.
-
-### The checks
-
-| Check | What it measures |
-|---|---|
-| Security thread | A continuous line or a column of aligned dashes where the windowed thread sits |
-| Print sharpness | Laplacian variance at a fixed width (intaglio print is crisp, copies are soft) |
-| Halftone / moire | FFT peaks from regular dot grids (inkjet and laser reprints) |
-| Ink saturation | The note's own ink colour, not just overall colour (a grey photocopy has none) |
-| Intaglio texture | Local Binary Pattern texture of the portrait compared with a genuine reference |
-| Reference match | ORB features plus RANSAC against genuine reference photos. A design copy also passes this |
-| Serial number | OCR of both number panels; they must read the same number |
-| Issuer text | OCR for "RESERVE BANK OF INDIA", and for words no RBI note carries (see below) |
-| Watermark window | The window must be blank in normal light (a printed fake portrait shows up here) |
-| Watermark (backlit) | Optional second photo with the note held against a light |
-
-A check that cannot decide (blur, glare, no reference) returns *skipped* and is not counted. An unreadable photo is
-never treated as evidence of a fake.
-
----
-
-## 4. Tesseract (OCR)
-
-`pytesseract` is only the Python wrapper. The **Tesseract program** must be installed on the computer:
+## 7. Testing and calibration
 
 ```bash
-brew install tesseract          # macOS
-sudo apt install tesseract-ocr  # Debian / Ubuntu
-tesseract --version             # confirm it works
+# make fake images from genuine ones
+python simulate_fake.py dataset/genuine dataset/fake
+
+# accuracy, precision, recall, confusion matrix and the mean score of each check
+python evaluate.py --out results.csv
+
+# calibrate the backlit watermark range from real backlit photos
+python watermark_probe.py dataset/backlit_genuine dataset/backlit_plain_paper
 ```
 
-Without Tesseract the app still runs, but:
-
-- the printed amount cannot be read (the denomination then comes from references or colour, see section 5),
-- the **Serial number** and **Issuer text** checks are skipped. A toy or prop note that copies a real design
-  is only caught by the Issuer text check, so it can go undetected.
+`evaluate.py` prints a table showing how far apart genuine and fake scores are for each check: a big gap means a useful check. Tune ranges and weights in `detector/config.py`.
 
 ---
 
-## 5. Which note is it? (denomination)
+## 8. Reference images
 
-Three layers, the first that answers wins. The source is shown under the banner whenever it is not the printed text.
-
-1. **Text.** OCR of the printed amount ("THE SUM OF FIVE HUNDRED RUPEES", or the big numerals). Most reliable. Needs Tesseract.
-2. **Design.** ORB match against genuine reference images in `references/<value>/`. Works without Tesseract.
-   Add a sharp, flat, full-note photo of any denomination to its folder, for example `references/2000/front.jpg`.
-3. **Colour.** Only for notes with a unique tint: lavender (₹100) and magenta (₹2000). Warm notes overlap too much,
-   so they are never guessed from colour. This is the weakest layer and is labelled as an estimate.
-
-### Status banners
-
-| Note | Banner |
-|---|---|
-| ₹1000 | **NOT IN USE ANYMORE.** Demonetised on 8 Nov 2016 |
-| ₹2000 | **NOT IN USE ANYMORE.** Withdrawn from circulation on 19 May 2023, but not demonetised and still legal tender |
-| ₹500 not matching the 2016 design | Warning that the old ₹500 (before 2016) is demonetised. Not certain, so there is no hard badge |
-| ₹10, 20, 50, 100, 200, 500 | Legal tender and in circulation |
-
-The analysis **always runs**, also for notes that are not in use. It only judges how the note was printed and does not change
-the note's status. Status text lives in `NOTES` in `detector/denomination.py` and is dated October 2026, so
-verify it on rbi.org.in.
+- `references/500_note.jpg` and `references/<value>/` hold genuine photos used for texture and design matching.
+- Use a **different** photo for the reference than the one you test, otherwise the match is trivially perfect.
+- Adding a good reference for a denomination (for example `references/2000/`) makes its identification and design check stronger.
 
 ---
 
-## 6. Verdict logic
+## 9. Current limitations (be honest in the demo)
 
-- Each check gives a score from 0 to 1. Scores are fused with weights from `config.WEIGHTS`:
-  60% weighted mean plus 40% mean of the two lowest scores, so one clearly failed check cannot be hidden by strong ones.
-- Verdicts: **Genuine** (score at or above the *Genuine if* threshold), **Suspicious**, **Likely Fake**.
-  *Likely Fake* needs at least 3 failed checks, so a bad light or glare alone cannot condemn a note.
-- **Decisive evidence overrides the score.** If the Issuer text check reads words that no RBI note carries
-  (for example "CHILDREN BANK", "FULL OF FUN", "MANORANJAN", "COUPON", "MOVIE", "PROP", "FAKE"), the verdict is
-  **Likely Fake** and the score is capped at 15%. A red *Counterfeit evidence* card lists the words found.
-  Other checks may stay green because a copied design passes design checks, so green bars do not mean genuine.
-- Notes without a validated layout profile (everything except ₹500, and the demonetised ₹1000) can only be
-  **No red flags** or **Suspicious**, never *Genuine*. For ₹1000, which has no layout profile, only the generic print
-  checks and the issuer check run.
-
-The *Report* tab downloads the result as JSON (denomination, how it was identified, status, verdict, every check).
+- Only the **₹500 (Mahatma Gandhi New Series)** layout is validated on real phone photos. ₹100, ₹1000 (old) and ₹2000 layouts were measured from specimen images, so their verdict stays at "No red flags" or "Suspicious".
+- A good **design copy** (or a toy note with a copied design) can pass the design checks. That is why process checks (halftone, colour, printed watermark) and OCR text checks can override the average.
+- The main fake data is **simulated** (photocopy, inkjet, low-res). Real counterfeits can behave differently.
+- Phone cameras cannot capture UV, microprinting, tactile or colour-shifting features.
+- OCR depends on photo quality; unreadable text is treated as inconclusive, not as proof of a fake.
+- Layout profiles use module-level state, which is fine for one user at a time (a local demo), not for a multi-user server.
+- Note status information is as of October 2026; verify on rbi.org.in.
 
 ---
 
-## 7. Sidebar options
+## 10. Possible future work
 
-| Option | Effect |
-|---|---|
-| Source: Upload / Webcam | Photo input |
-| Image is already a cropped note | Use when the photo contains only the note |
-| Reject non-banknote images | The gate. Turn it off to analyse any image anyway |
-| Analysis animation | Step-by-step scan before the verdict |
-| Simulate an attack | Degrades the note as a photocopy, inkjet reprint, low-res scan, or printed fake watermark, to watch the verdict react |
-| Watermark (hold note to light) | Upload a backlit photo, or use a demo simulation (not a real measurement) |
-| Decision thresholds | Move the Genuine / Suspicious cut-offs |
-| Enabled checks | Switch individual checks off |
-| Genuine reference images | Add or remove ₹500 reference photos. Use a **different** photo from the one you test |
+- Validate the ₹100, ₹200, ₹2000 and old ₹1000 profiles on real photos and unlock full verdicts.
+- Add ₹10, ₹20, ₹50, ₹200 layout profiles.
+- Collect a real backlit watermark dataset and calibrate the watermark check.
+- Add a small learned classifier on top of the explainable features and compare it with the rule-based fusion.
+- Mobile-friendly capture guide (edge overlay, blur and glare warnings).
 
 ---
 
-## 8. Tuning
+## 11. Quick demo script (2 minutes)
 
-Everything tunable is in `detector/config.py`:
-
-- `WEIGHTS` is the weight of each check in the fused score.
-- `GENUINE_AT`, `SUSPICIOUS_AT`, `MIN_FAILED_FOR_FAKE` are the verdict thresholds.
-- `*_RANGE` values map a raw measurement to a 0 to 1 score. Calibrate them on your own photos with `evaluate.py`.
-- `GATE_*` values tune the banknote gate.
-- `PROFILES` holds per-denomination layouts (regions as fractions of the straightened note). Only the ₹500 is validated
-  on real phone photos. The others were measured from official RBI specimen images.
-
-Helper scripts:
-
-```bash
-python simulate_fake.py dataset/genuine dataset/fake      # build simulated fakes from genuine photos
-python watermark_probe.py dataset/backlit_genuine dataset/backlit_plain_paper   # calibrate the watermark range
-```
+1. Upload a genuine ₹500 photo: show the score gauge, the green annotated boxes, and open the *Evidence* tab for the thread and texture checks.
+2. In *Simulate an attack*, pick **Photocopy**: colour disappears, so the verdict drops to **Likely Fake** because of decisive evidence.
+3. Pick **Inkjet reprint**: the halftone check catches the printer dot grid.
+4. Pick **Printed fake watermark**: the watermark window check fires.
+5. Upload a ₹2000 specimen: show the "not in use anymore" status banner and the "denomination votes" line.
+6. Open the *Pipeline* tab to show edges, outline and the straightened note, and the *Report* tab for the JSON export.
 
 ---
 
-## 9. Taking photos that work well
-
-- Flat note, plain contrasting background, the whole note in frame, even light, no glare, camera square-on.
-- Sharp focus. A blurred photo lowers sharpness and also stops the OCR checks from reading.
-- Upload the **front** (the side with the portrait). A back-side upload is recognised and refused politely.
-- Use a different photo for the reference than for the test, otherwise the match is trivially perfect.
-
----
-
-## 10. Troubleshooting
-
-| Message or symptom | Fix |
-|---|---|
-| "Your `detector/` folder does not match this `app.py`" | Replace **every** file in `detector/` with the matching set, delete `detector/__pycache__/`, restart |
-| "This file could not be read as an image" | The file is corrupt or a different format renamed to .png/.jpg (AVIF, HEIC). Re-export it as PNG or JPG. `pip install pillow-heif` helps with HEIC/AVIF |
-| "This does not look like a banknote" | The photo shows several unrelated colours, is blank, or has the wrong shape. Retake it, or turn off *Reject non-banknote images* |
-| "No banknote detected" | The edges were not found. Use a plain background, or tick *Image is already a cropped note* |
-| Serial number or Issuer text always *skipped* | Tesseract is not installed or not on the PATH (`tesseract --version`) |
-| Denomination shown as "estimated from colour" | Tesseract could not read the amount. Install it, or add a reference to `references/<value>/` |
-
----
-
-## 11. Limitations
-
-- Classical image checks cannot match a physical inspection. A high-quality copy that reproduces the printed words and
-  the design well can pass the image checks.
-- The Issuer text check is positive evidence only. It can prove a note is a toy or prop, but cannot prove a note is genuine.
-- Only the ₹500 layout is validated on real photos. All other denominations are limited to *No red flags* / *Suspicious*.
-- Real counterfeits cannot be obtained legally, so fake-detection quality was checked with simulated attacks and
-  toy/prop notes, not with real counterfeits.
-- Currencies other than the Indian rupee are not supported in this version.
+*Built for learning and demonstration of explainable image processing. Not affiliated with the Reserve Bank of India.*

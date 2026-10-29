@@ -78,16 +78,18 @@ def find_numeral(text):
 
 
 def read_amount(note_hr):
-    """OCR the whole note (upright and upside-down) and read the printed amount. None if Tesseract is missing or unreadable."""
+    """OCR the whole note (upright and upside-down) and read the printed amount.
+    Returns (value, confidence, kind) with kind "words" ("THE SUM OF TWO THOUSAND RUPEES": reliable) or "numeral" (big digits:
+    easily truncated, e.g. 1000 read as 100, so only weak evidence). (None, 0, None) if Tesseract is missing or nothing is readable."""
     try:
         import pytesseract
         pytesseract.get_tesseract_version()
     except Exception:
-        return None, 0.0
+        return None, 0.0, None
     key = hashlib.md5(note_hr.tobytes()).hexdigest()
     if key in _CACHE:
         return _CACHE[key]
-    out = (None, 0.0)
+    out = (None, 0.0, None)
     for note in (note_hr, cv2.rotate(note_hr, cv2.ROTATE_180)):          # the note may be uploaded upside-down
         h, w = note.shape[:2]
         region = cv2.resize(note[int(0.25 * h):int(0.70 * h), int(0.50 * w):int(0.85 * w)], None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
@@ -102,11 +104,14 @@ def read_amount(note_hr):
             except Exception:
                 continue
             val, conf = finder(text)
-            if val is not None and conf > out[1]:
-                out = (val, conf)
-            if out[1] >= 0.6:
+            kind = "words" if finder is find_amount else "numeral"
+            if kind == "words" and conf < 0.8:
+                continue                      # the amount WORDS must match well; a loose match is no evidence
+            if val is not None and (out[2] is None or (kind == "words" and out[2] == "numeral") or (kind == out[2] and conf > out[1])):
+                out = (val, conf, kind)
+            if out[2] == "words":
                 break
-        if out[1] >= 0.6:
+        if out[2] == "words":
             break
     _CACHE[key] = out
     return out
@@ -152,18 +157,49 @@ def design_guess(note, ref_sets):
 
 
 def identify_note(note_hr, note, ref_sets=None):
-    """Which denomination is this? Returns dict(value, conf, source) with source in {"text", "design", "colour", None}.
-    Text (OCR) is the most reliable; design and colour keep the app useful when Tesseract is missing or cannot read the note."""
-    val, conf = read_amount(note_hr)
+    """Which denomination is this? Returns dict(value, conf, source, votes) with source in {"text", "design", "colour", None}.
+
+    Every layer casts a weighted vote instead of "first one that answers wins": an OCR numeral alone used to win even when it was
+    plainly wrong (a Rs 2000 read as "100" because OCR dropped the trailing zeros and was labelled Rs 100).
+      amount words (OCR)     0.90   very reliable when readable
+      design match (ORB)     0.4 - 0.95 grows with the number of geometric inliers
+      colour family          0.50   only the notes with a unique tint (Rs 100 lavender, Rs 2000 magenta)
+      big numeral (OCR)      0.35   weak: digits get truncated / confused
+    Agreement adds up; the highest total wins, and a value needs >= 0.35 in total."""
+    votes = {}
+
+    def cast(v, w, src):
+        d = votes.setdefault(v, dict(w=0.0, src=None, best=0.0))
+        d["w"] += w
+        if w > d["best"]:
+            d["best"], d["src"] = w, src
+
+    val, conf, kind = read_amount(note_hr)
     if val is not None:
-        return dict(value=val, conf=conf, source="text")
-    val, conf = design_guess(note, ref_sets)
-    if val is not None:
-        return dict(value=val, conf=conf, source="design")
-    val, conf = colour_guess(note)
-    if val is not None:
-        return dict(value=val, conf=conf, source="colour")
-    return dict(value=None, conf=0.0, source=None)
+        if kind == "words":
+            cast(val, 0.90, "text")
+        else:
+            cast(val, 0.35, "text")
+    d_val, d_conf = design_guess(note, ref_sets)
+    c_val, c_conf = colour_guess(note)
+    # Colour veto: Rs 100 (lavender) and Rs 2000 (magenta) share the Gandhi-series layout, so the ORB design match can pick the
+    # wrong one - above all when the true denomination has NO reference image of its own (the match then lands on the closest
+    # look-alike). A tint that clearly belongs to another denomination outranks such a design match.
+    design_vetoed = d_val is not None and c_val is not None and d_val != c_val
+    if d_val is not None and not design_vetoed:
+        cast(d_val, d_conf, "design")
+    if c_val is not None:
+        cast(c_val, c_conf, "colour")
+    if not votes:
+        return dict(value=None, conf=0.0, source=None, votes={})
+    top = max(votes, key=lambda v: votes[v]["w"])
+    if votes[top]["w"] < 0.35:
+        return dict(value=None, conf=0.0, source=None, votes={})
+    out = dict(value=top, conf=min(votes[top]["w"], 0.99), source=votes[top]["src"],
+               votes={v: round(d["w"], 2) for v, d in votes.items()})
+    if design_vetoed:
+        out["vetoed"] = d_val
+    return out
 
 
 SOURCE_LABEL = {"text": "read from the printed amount", "design": "matched against a genuine reference of that denomination",

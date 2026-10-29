@@ -39,6 +39,12 @@ HALFTONE_RANGE = (25.0, 100.0)       # FFT peak/median ratio; HIGH ratio = halft
 SATURATION_RANGE = (15.0, 70.0)      # mean S channel (0..255); only a fallback for other note colours
 INK_HUE = (25, 100)                  # OpenCV hue band of the note's green/olive ink
 INK_RANGE = (1.0, 8.0)               # % of pixels carrying that ink (a B/W copy has ~0, even with a paper tint)
+# Copy signals so strong that one of them is enough for "Likely Fake" (a design copy passes the design checks, so a copy usually fails
+# only ONE process check). Calibrated on the simulated attacks in simulate_fake.py: genuine photos stay far below these values.
+NO_COLOUR_S = 6.0                    # mean saturation (0..255) below this = no colour at all; every Indian note is printed in colour
+HALFTONE_DECISIVE = 250.0            # FFT peak/median; genuine ~5-40, a printer's dot screen gives hundreds to thousands
+WM_EDGE_DECISIVE = 0.10              # edge density in the blank watermark window (validated layouts only); genuine ~2-5%, a printed portrait ~12%
+PROFILE_VALIDATED = True             # set by set_profile(): layout-based decisive checks only fire on a validated layout
 MIN_FAILED_FOR_FAKE = 3              # 'Likely Fake' needs at least this many failed checks, otherwise 'Suspicious'
 LBP_ENTROPY_RANGE = (4.5, 6.8)       # bits (fallback only)
 LBP_SIM_RANGE = (0.25, 0.55)         # histogram intersection vs genuine reference
@@ -71,8 +77,11 @@ PROFILES = {
                rois=dict(thread=(0.51, 0.0, 0.60, 1.0), portrait=(0.27, 0.15, 0.53, 0.95), watermark=(0.77, 0.14, 0.88, 0.56),
                          serial=(0.60, 0.76, 0.99, 0.98), serial2=(0.0, 0.15, 0.36, 0.38))),
     2000: dict(validated=False, ink_hue=(135, 179),
-               rois=dict(thread=(0.53, 0.0, 0.62, 1.0), portrait=(0.32, 0.17, 0.55, 0.95), watermark=(0.76, 0.20, 0.88, 0.62),
+               rois=dict(thread=(0.55, 0.0, 0.65, 1.0), portrait=(0.32, 0.17, 0.55, 0.95), watermark=(0.76, 0.20, 0.88, 0.62),
                          serial=(0.60, 0.78, 0.99, 0.98), serial2=(0.0, 0.16, 0.36, 0.38))),
+    1000: dict(validated=False, ink_hue=(25, 100),     # old (pre-2016) Rs 1000: portrait right, blank window LEFT, thread at ~56%
+               rois=dict(thread=(0.535, 0.0, 0.595, 1.0), portrait=(0.68, 0.20, 0.84, 0.95), watermark=(0.12, 0.22, 0.27, 0.62),
+                         serial=(0.72, 0.03, 0.99, 0.20), serial2=(0.03, 0.82, 0.34, 0.99))),
     100:  dict(validated=False, ink_hue=(110, 140),
                rois=dict(thread=(0.51, 0.0, 0.60, 1.0), portrait=(0.28, 0.20, 0.52, 0.95), watermark=(0.74, 0.12, 0.88, 0.58),
                          serial=(0.60, 0.78, 0.97, 0.98), serial2=(0.0, 0.16, 0.36, 0.38))),
@@ -81,8 +90,9 @@ PROFILES = {
 
 def set_profile(value):
     """Activate the layout profile of a denomination (module-level state: fine for one user at a time)."""
-    global INK_HUE
+    global INK_HUE, PROFILE_VALIDATED
     p = PROFILES.get(value, PROFILES[500])
+    PROFILE_VALIDATED = bool(p["validated"])
     ROIS.clear()
     ROIS.update(p["rois"])
     INK_HUE = p["ink_hue"]

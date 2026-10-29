@@ -53,9 +53,22 @@ def find_note_quad(img):
     return None, edges
 
 
+def _fills_frame(quad, shape):
+    """True when the detected outline spans (almost) the whole image: the photo is already a cropped note, so there is
+    nothing to straighten. Warping such an image by a noisy outline only skews it (corners snap onto the image border)."""
+    H, W = shape[:2]
+    xs, ys = quad[:, 0], quad[:, 1]
+    return (xs.max() - xs.min()) >= 0.94 * W and (ys.max() - ys.min()) >= 0.94 * H
+
+
 def rectify(img):
     """Returns dict(note=BGR NOTE_WxNOTE_H, quad=..., edges=..., found=bool)."""
     quad, edges = find_note_quad(img)
+    if quad is not None and _fills_frame(quad, img.shape):
+        quad = None                       # already cropped: use the image as the note, but still report it as found
+        note = cv2.resize(img, (NOTE_W, NOTE_H), interpolation=cv2.INTER_AREA)
+        return dict(note=note, note_hr=cv2.resize(img, (2 * NOTE_W, 2 * NOTE_H), interpolation=cv2.INTER_CUBIC),
+                    quad=None, edges=edges, found=True)
     if quad is None:
         note = cv2.resize(img, (NOTE_W, NOTE_H), interpolation=cv2.INTER_AREA)
         return dict(note=note, note_hr=cv2.resize(img, (2 * NOTE_W, 2 * NOTE_H), interpolation=cv2.INTER_CUBIC),
